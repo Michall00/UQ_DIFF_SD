@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "uqdiff"
@@ -22,6 +22,7 @@ dependencies = [
     "torch>=2.0",
     "numpy>=1.24",
     "laplace-torch>=0.1",
+    "curvlinops-for-pytorch<3",
     "tqdm",
     "matplotlib",
     "pyyaml",

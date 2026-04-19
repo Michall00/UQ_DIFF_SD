@@ -10,3 +10,4 @@ outputs/
 assets/figures/
 checkpoints/
 checkpoints/*.pth
+assets/
