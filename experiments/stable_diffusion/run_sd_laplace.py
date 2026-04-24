@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-from diffusers import StableDiffusionPipeline, DDIMScheduler
+from diffusers import StableDiffusionPipeline, DDIMScheduler, DDPMScheduler
 from tqdm import tqdm
 
 
@@ -48,12 +48,36 @@ def get_args():
     p.add_argument("--steps", type=int, default=30,
                    help="DDIM inference steps")
     p.add_argument("--guidance_scale", type=float, default=7.5)
+    p.add_argument(
+        "--scheduler",
+        type=str,
+        default="ddim",
+        choices=["ddim", "ddpm"],
+        help="Reverse sampler used for image generation and FLARE transport.",
+    )
     p.add_argument("--height", type=int, default=512)
     p.add_argument("--width", type=int, default=512)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="mps")
+    p.add_argument(
+        "--torch_dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "float32", "float16", "bfloat16"],
+        help="Model dtype. Use auto for float16 on CUDA and float32 elsewhere.",
+    )
     p.add_argument("--out_dir", type=str, default="assets/stable_diffusion/laplace")
     return p.parse_args()
+
+
+def resolve_torch_dtype(dtype_name: str, device: str) -> torch.dtype:
+    if dtype_name == "auto":
+        return torch.float16 if device.startswith("cuda") else torch.float32
+    if dtype_name == "float16":
+        return torch.float16
+    if dtype_name == "bfloat16":
+        return torch.bfloat16
+    return torch.float32
 
 
 def gamma2_conv2d(
@@ -87,6 +111,57 @@ def gamma2_conv2d(
 
     H_out, W_out = features.shape[2], features.shape[3]
     return gamma2.view(B, C_out, H_out, W_out).clamp_min(0)
+
+
+def ddim_transport_coeffs(
+    abar: torch.Tensor,
+    timesteps: list[torch.Tensor],
+    i: int,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    t_int = timesteps[i].item()
+    t_next = timesteps[i + 1].item() if i < len(timesteps) - 1 else 0
+
+    ab_t = abar[t_int]
+    ab_next = abar[t_next] if t_next > 0 else torch.tensor(1.0, device=device)
+
+    a = torch.sqrt(ab_next / ab_t.clamp_min(1e-12))
+    b = (
+        torch.sqrt(1 - ab_next)
+        - torch.sqrt(ab_next * (1 - ab_t) / ab_t.clamp_min(1e-12))
+    )
+    return a, b
+
+
+def ddpm_transport_coeffs(
+    scheduler: DDPMScheduler,
+    t: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Linear DDPM transport coefficients for epsilon prediction.
+
+    DDPM adds sampler noise in scheduler.step(). FLARE uses only the epistemic
+    term transported through eps_theta, so the extra sampler variance is not
+    accumulated here.
+    """
+    alpha_prod_t = scheduler.alphas_cumprod[t]
+    prev_t = scheduler.previous_timestep(t)
+    alpha_prod_t_prev = (
+        scheduler.alphas_cumprod[prev_t]
+        if prev_t >= 0
+        else scheduler.one.to(alpha_prod_t.device)
+    )
+
+    beta_prod_t = 1 - alpha_prod_t
+    beta_prod_t_prev = 1 - alpha_prod_t_prev
+    current_alpha_t = alpha_prod_t / alpha_prod_t_prev
+    current_beta_t = 1 - current_alpha_t
+
+    pred_x0_coeff = (alpha_prod_t_prev.sqrt() * current_beta_t) / beta_prod_t.clamp_min(1e-12)
+    current_sample_coeff = current_alpha_t.sqrt() * beta_prod_t_prev / beta_prod_t.clamp_min(1e-12)
+
+    a = pred_x0_coeff / alpha_prod_t.sqrt().clamp_min(1e-12) + current_sample_coeff
+    b = -pred_x0_coeff * beta_prod_t.sqrt() / alpha_prod_t.sqrt().clamp_min(1e-12)
+    return a, b
 
 
 class ManualDiagLaplace:
@@ -204,7 +279,7 @@ def generate_z0(unet, scheduler, text_emb, uncond_emb, latent_shape,
 def sample_with_flare(
     unet, laplace: ManualDiagLaplace, scheduler, text_emb, uncond_emb, abar,
     latent_shape, steps, guidance_scale, device, seed,
-    feat_cap,
+    feat_cap, scheduler_name,
 ):
     """DDIM sampling with FLARE epistemic uncertainty transport.
 
@@ -238,18 +313,17 @@ def sample_with_flare(
         cond_feats = feat_cap.features[1:2]
         gamma2_t = gamma2_conv2d(cond_feats, laplace.posterior_variance, unet.conv_out)
 
-        t_next = timesteps[i + 1].item() if i < len(timesteps) - 1 else 0
-        ab_t = abar[t_int]
-        ab_next = abar[t_next] if t_next > 0 else torch.tensor(1.0, device=device)
-
-        a = torch.sqrt(ab_next / ab_t.clamp_min(1e-12))
-        b = (torch.sqrt(1 - ab_next)
-             - torch.sqrt(ab_next * (1 - ab_t) / ab_t.clamp_min(1e-12)))
+        if scheduler_name == "ddim":
+            a, b = ddim_transport_coeffs(abar, timesteps, i, device)
+        elif scheduler_name == "ddpm":
+            a, b = ddpm_transport_coeffs(scheduler, t_int)
+        else:
+            raise ValueError(f"Unsupported scheduler: {scheduler_name}")
 
         Var_proj = Var_proj + cum_a2 * (b ** 2) * gamma2_t
         cum_a2 = cum_a2 * (a ** 2)
 
-        z = scheduler.step(eps, t, z).prev_sample
+        z = scheduler.step(eps, t, z, generator=gen).prev_sample
 
     return z, Var_proj
 
@@ -320,8 +394,9 @@ def main():
     torch.manual_seed(args.seed)
 
     print(f"Loading {args.model_id}...")
+    torch_dtype = resolve_torch_dtype(args.torch_dtype, device)
     pipe = StableDiffusionPipeline.from_pretrained(
-        args.model_id, torch_dtype=torch.float32,
+        args.model_id, torch_dtype=torch_dtype,
     )
     pipe = pipe.to(device)
     if hasattr(pipe, "enable_attention_slicing"):
@@ -329,7 +404,8 @@ def main():
 
     unet = pipe.unet
     vae = pipe.vae
-    scheduler = DDIMScheduler.from_pretrained(args.model_id, subfolder="scheduler")
+    scheduler_cls = DDIMScheduler if args.scheduler == "ddim" else DDPMScheduler
+    scheduler = scheduler_cls.from_pretrained(args.model_id, subfolder="scheduler")
 
     tok = pipe.tokenizer
     text_input = tok(
@@ -373,6 +449,9 @@ def main():
 
     images = []
     var_maps = []
+    var_mean = []
+    var_sum = []
+    var_p95 = []
     for i in range(args.n_samples):
         seed = args.seed + 100 + i
         print(f"Sampling image {i+1}/{args.n_samples} (seed={seed})...")
@@ -380,18 +459,25 @@ def main():
         z0, var_proj = sample_with_flare(
             unet, laplace, scheduler, text_emb, uncond_emb, abar,
             latent_shape, args.steps, args.guidance_scale,
-            device, seed, feat_cap,
+            device, seed, feat_cap, args.scheduler,
         )
         print(f"  Done in {time.time()-t0:.0f}s")
 
         img = decode_latent(vae, z0, device)
+        var_np = var_proj.squeeze(0).detach().cpu().numpy()
         images.append(img)
-        var_maps.append(var_proj.squeeze(0).detach().cpu().numpy())
+        var_maps.append(var_np)
+        var_mean.append(float(var_np.mean()))
+        var_sum.append(float(var_np.sum()))
+        var_p95.append(float(np.percentile(var_np, 95)))
 
     np.savez_compressed(
         os.path.join(args.out_dir, "laplace_results.npz"),
         images=np.stack(images),
         var_maps=np.stack(var_maps),
+        var_mean=np.array(var_mean, dtype=np.float32),
+        var_sum=np.array(var_sum, dtype=np.float32),
+        var_p95=np.array(var_p95, dtype=np.float32),
         prompt=np.array(args.prompt),
     )
     print(f"Saved results to {args.out_dir}/laplace_results.npz")
