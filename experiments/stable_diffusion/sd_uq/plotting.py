@@ -42,6 +42,28 @@ def save_heatmap_png(attn_map: np.ndarray, path: str):
     plt.close()
 
 
+def save_attention_overlay_png(image, attn_map: np.ndarray, path: str):
+    image_arr = _as_rgb_float(image)
+    attn = np.asarray(attn_map, dtype=np.float32)
+    attn_t = torch.from_numpy(attn).view(1, 1, *attn.shape).float()
+    attn_up = torch.nn.functional.interpolate(
+        attn_t,
+        size=image_arr.shape[:2],
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze().numpy()
+    attn_up = attn_up - float(np.nanmin(attn_up))
+    attn_up = attn_up / (float(np.nanmax(attn_up)) + 1e-10)
+
+    plt.figure(figsize=(5, 5))
+    plt.imshow(image_arr)
+    plt.imshow(attn_up, cmap="magma", alpha=0.45)
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
 def plot_results(images, var_maps, prompt, out_dir, max_samples=16, filename="sd_laplace_flare.png"):
     if max_samples <= 0:
         print("Skipping plot (--plot_max_samples <= 0).")

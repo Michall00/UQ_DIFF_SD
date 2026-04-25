@@ -16,7 +16,12 @@ from pathlib import Path
 def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--prompt", type=str, default="a human hand with five fingers")
-    p.add_argument("--words", type=str, default="hand,fingers")
+    p.add_argument(
+        "--words",
+        type=str,
+        default="",
+        help="Comma-separated DAAM words. Empty means infer content words from the prompt.",
+    )
     p.add_argument("--model_id", type=str, default="CompVis/stable-diffusion-v1-4")
     p.add_argument("--scheduler", choices=["ddim", "ddpm"], default="ddim")
     p.add_argument("--steps", type=int, default=30)
@@ -43,7 +48,7 @@ def get_args():
     p.add_argument(
         "--daam_with",
         nargs="*",
-        default=["daam==0.2.0", "huggingface-hub==0.17.3"],
+        default=["daam==0.2.0", "huggingface-hub==0.17.3", "matplotlib"],
         help="Additional uv --with packages for the DAAM stage.",
     )
     p.add_argument("--save_daam_images", action="store_true")

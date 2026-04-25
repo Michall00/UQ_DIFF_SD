@@ -26,13 +26,15 @@ SUBNET_MC_SAMPLES ?= 2
 ATTENTION_AGGREGATION ?= none
 ATTENTION_TOKEN_INDICES ?=
 SAVE_ATTENTION_MAPS ?=
-DAAM_WORDS ?= hand,fingers
+DAAM_WORDS ?=
 DAAM_PYTHON ?= 3.11
 DAAM_UNCERTAINTY_NPZ ?= assets/stable_diffusion/subnet_ddim/laplace_results.npz
 DAAM_UNCERTAINTY_KEYS ?= var_maps
 DAAM_BAYESDIFF_OUT_DIR ?= assets/stable_diffusion/daam_bayesdiff
 DAAM_SCORE_KEY ?= daam_var_mean
-DAAM_WITH := --python $(DAAM_PYTHON) --with daam==0.2.0 --with huggingface-hub==0.17.3
+DAAM_WITH := --python $(DAAM_PYTHON) --with daam==0.2.0 --with huggingface-hub==0.17.3 --with matplotlib
+DAAM_SAVE_IMAGES ?= --save_images
+DAAM_BAYESDIFF_SAVE_IMAGES ?= --save_daam_images
 EVAL_NPZS ?= assets/stable_diffusion/last_layer_ddim/laplace_results.npz assets/stable_diffusion/subnet_ddim/laplace_results.npz
 EVAL_OUT_DIR ?= assets/stable_diffusion/eval_ddim
 SDXL_EVAL_NPZS ?= assets/stable_diffusion/sdxl_last_layer_ddim/laplace_results.npz assets/stable_diffusion/sdxl_subnet_ddim/laplace_results.npz
@@ -78,8 +80,9 @@ help:
 	@echo "  make sd-subnet-ddim ATTENTION_AGGREGATION=cross SAVE_ATTENTION_MAPS=--save_attention_maps"
 	@echo "  make sd-benchmark-ddim N_SAMPLES=100"
 	@echo "  make sdxl-benchmark-ddim PROMPT=\"a soccer match in a packed stadium\" N_SAMPLES=50"
-	@echo "  make sd-daam-subnet-ddim DAAM_WORDS=hand,fingers"
+	@echo "  make sd-daam-subnet-ddim DAAM_WORDS=hand,fingers  # empty DAAM_WORDS auto-infers prompt words"
 	@echo "  make sd-daam-bayesdiff-ddim DAAM_WORDS=player,ball N_SAMPLES=16"
+	@echo "  make all-daam DAAM_SAVE_IMAGES= DAAM_BAYESDIFF_SAVE_IMAGES=  # skip DAAM PNGs"
 
 all: sd-last-ddim sd-last-ddpm sd-subnet-ddim sd-subnet-ddpm all-daam
 
@@ -312,7 +315,8 @@ sd-daam-ddim:
 		--seed $(SEED) \
 		--uncertainty_npz assets/stable_diffusion/last_layer_ddim/laplace_results.npz \
 		--uncertainty_keys "$(DAAM_UNCERTAINTY_KEYS)" \
-		--out_dir assets/stable_diffusion/daam_last_layer_ddim
+		--out_dir assets/stable_diffusion/daam_last_layer_ddim \
+		$(DAAM_SAVE_IMAGES)
 
 sd-daam-subnet-ddim:
 	uv run $(DAAM_WITH) python $(DAAM_SCRIPT) \
@@ -330,7 +334,8 @@ sd-daam-subnet-ddim:
 		--seed $(SEED) \
 		--uncertainty_npz "$(DAAM_UNCERTAINTY_NPZ)" \
 		--uncertainty_keys "$(DAAM_UNCERTAINTY_KEYS)" \
-		--out_dir assets/stable_diffusion/daam_subnet_ddim
+		--out_dir assets/stable_diffusion/daam_subnet_ddim \
+		$(DAAM_SAVE_IMAGES)
 
 sd-daam-bayesdiff-ddim:
 	uv run python $(DAAM_BAYESDIFF_SCRIPT) \
@@ -351,7 +356,8 @@ sd-daam-bayesdiff-ddim:
 		--seed $(SEED) \
 		--laplace_mode last_layer \
 		--daam_python $(DAAM_PYTHON) \
-		--out_dir "$(DAAM_BAYESDIFF_OUT_DIR)/last_layer_ddim"
+		--out_dir "$(DAAM_BAYESDIFF_OUT_DIR)/last_layer_ddim" \
+		$(DAAM_BAYESDIFF_SAVE_IMAGES)
 
 sd-daam-bayesdiff-ddpm:
 	uv run python $(DAAM_BAYESDIFF_SCRIPT) \
@@ -372,7 +378,8 @@ sd-daam-bayesdiff-ddpm:
 		--seed $(SEED) \
 		--laplace_mode last_layer \
 		--daam_python $(DAAM_PYTHON) \
-		--out_dir "$(DAAM_BAYESDIFF_OUT_DIR)/last_layer_ddpm"
+		--out_dir "$(DAAM_BAYESDIFF_OUT_DIR)/last_layer_ddpm" \
+		$(DAAM_BAYESDIFF_SAVE_IMAGES)
 
 sd-daam-bayesdiff-subnet-ddim:
 	uv run python $(DAAM_BAYESDIFF_SCRIPT) \
@@ -396,7 +403,8 @@ sd-daam-bayesdiff-subnet-ddim:
 		--seed $(SEED) \
 		--laplace_mode subnet \
 		--daam_python $(DAAM_PYTHON) \
-		--out_dir "$(DAAM_BAYESDIFF_OUT_DIR)/subnet_ddim"
+		--out_dir "$(DAAM_BAYESDIFF_OUT_DIR)/subnet_ddim" \
+		$(DAAM_BAYESDIFF_SAVE_IMAGES)
 
 sd-daam-bayesdiff-subnet-ddpm:
 	uv run python $(DAAM_BAYESDIFF_SCRIPT) \
@@ -420,7 +428,8 @@ sd-daam-bayesdiff-subnet-ddpm:
 		--seed $(SEED) \
 		--laplace_mode subnet \
 		--daam_python $(DAAM_PYTHON) \
-		--out_dir "$(DAAM_BAYESDIFF_OUT_DIR)/subnet_ddpm"
+		--out_dir "$(DAAM_BAYESDIFF_OUT_DIR)/subnet_ddpm" \
+		$(DAAM_BAYESDIFF_SAVE_IMAGES)
 
 sd-show:
 	uv run python -c "import numpy as np; p='$(OUT_DIR)/laplace_results.npz'; d=np.load(p); order=np.argsort(d['var_mean']); print('file:', p); print('least uncertain:', order[:10], d['var_mean'][order[:10]]); print('most uncertain:', order[-10:][::-1], d['var_mean'][order[-10:][::-1]])"

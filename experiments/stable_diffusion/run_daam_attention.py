@@ -12,19 +12,45 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from sd_uq.aggregation import attention_weighted_scores, normalize_attention_map
-from sd_uq.plotting import save_heatmap_png
+
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "by",
+    "for",
+    "from",
+    "in",
+    "into",
+    "is",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "with",
+}
 
 
 def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--prompt", type=str, default="a human hand with five fingers")
-    p.add_argument("--words", type=str, default="hand,fingers")
+    p.add_argument(
+        "--words",
+        type=str,
+        default="",
+        help="Comma-separated words to aggregate. Empty means infer content words from the prompt.",
+    )
     p.add_argument("--model_id", type=str, default="CompVis/stable-diffusion-v1-4")
     p.add_argument("--scheduler", choices=["ddim", "ddpm"], default="ddim")
     p.add_argument("--steps", type=int, default=30)
@@ -70,11 +96,25 @@ def resolve_torch_dtype(dtype_name: str, device: str) -> torch.dtype:
     return torch.float32
 
 
-def parse_words(raw: str) -> list[str]:
-    words = [word.strip() for word in raw.split(",") if word.strip()]
+def infer_words_from_prompt(prompt: str) -> list[str]:
+    seen = set()
+    words = []
+    for token in re.findall(r"[A-Za-z][A-Za-z'-]*", prompt.lower()):
+        token = token.strip("'-")
+        if len(token) < 3 or token in STOPWORDS or token in seen:
+            continue
+        seen.add(token)
+        words.append(token)
     if not words:
         raise ValueError("Could not infer DAAM words from prompt. Pass --words explicitly.")
     return words
+
+
+def parse_words(raw: str, prompt: str) -> tuple[list[str], bool]:
+    words = [word.strip() for word in raw.split(",") if word.strip()]
+    if words:
+        return words, False
+    return infer_words_from_prompt(prompt), True
 
 
 def parse_uncertainty_keys(raw: str) -> list[str]:
@@ -92,10 +132,40 @@ def daam_prefix_for_key(key: str) -> str:
     return key
 
 
+def attention_stats(attn_map: np.ndarray) -> dict[str, float]:
+    attn = normalize_attention_map(attn_map).reshape(-1)
+    n = attn.size
+    if n == 0 or float(attn.sum()) <= 0:
+        return {
+            "entropy_norm": np.nan,
+            "effective_area_frac": np.nan,
+            "top10_mass": np.nan,
+            "area50_frac": np.nan,
+            "area80_frac": np.nan,
+        }
+
+    sorted_attn = np.sort(attn)[::-1]
+    entropy = float(-(attn * np.log(attn + 1e-12)).sum())
+    entropy_norm = entropy / float(np.log(n))
+    effective_area_frac = float(np.exp(entropy) / n)
+    top10_n = max(1, int(np.ceil(0.10 * n)))
+    top10_mass = float(sorted_attn[:top10_n].sum())
+    cumsum = np.cumsum(sorted_attn)
+    area50_frac = float((np.searchsorted(cumsum, 0.50, side="left") + 1) / n)
+    area80_frac = float((np.searchsorted(cumsum, 0.80, side="left") + 1) / n)
+    return {
+        "entropy_norm": entropy_norm,
+        "effective_area_frac": effective_area_frac,
+        "top10_mass": top10_mass,
+        "area50_frac": area50_frac,
+        "area80_frac": area80_frac,
+    }
+
+
 def main():
     args = get_args()
     os.makedirs(args.out_dir, exist_ok=True)
-    words = parse_words(args.words)
+    words, inferred_words = parse_words(args.words, args.prompt)
     uncertainty_keys = parse_uncertainty_keys(args.uncertainty_keys)
 
     try:
@@ -143,6 +213,11 @@ def main():
         for key in uncertainty_keys
     }
     seeds = []
+    attn_entropy_norm = []
+    attn_effective_area_frac = []
+    attn_top10_mass = []
+    attn_area50_frac = []
+    attn_area80_frac = []
 
     for i in range(args.n_samples):
         seed = args.seed + args.seed_offset + i
@@ -176,15 +251,44 @@ def main():
                 word_maps.append(global_heat_map.compute_word_heat_map(word).value)
             except ValueError as exc:
                 print(f"  Skipping DAAM word {word!r}: {exc}")
-        if not word_maps:
+        if word_maps:
+            attn_map = normalize_attention_map(torch.stack(word_maps).mean(dim=0))
+        elif inferred_words:
+            print(
+                "  Warning: no inferred DAAM words matched the prompt tokens; "
+                "using a uniform attention map for this sample."
+            )
+            h = max(1, args.height // 8)
+            w = max(1, args.width // 8)
+            attn_map = np.full((h, w), 1.0 / (h * w), dtype=np.float32)
+        else:
             raise RuntimeError(f"No DAAM maps could be computed for words: {words}")
 
-        attn_map = normalize_attention_map(torch.stack(word_maps).mean(dim=0))
         daam_maps.append(attn_map)
+        stats = attention_stats(attn_map)
+        attn_entropy_norm.append(stats["entropy_norm"])
+        attn_effective_area_frac.append(stats["effective_area_frac"])
+        attn_top10_mass.append(stats["top10_mass"])
+        attn_area50_frac.append(stats["area50_frac"])
+        attn_area80_frac.append(stats["area80_frac"])
+        print(
+            "  DAAM spread: "
+            f"entropy={stats['entropy_norm']:.3f}, "
+            f"effective_area={stats['effective_area_frac']:.3f}, "
+            f"top10_mass={stats['top10_mass']:.3f}, "
+            f"area50={stats['area50_frac']:.3f}"
+        )
 
         if args.save_images:
+            from sd_uq.plotting import save_attention_overlay_png, save_heatmap_png
+
             out.images[0].save(Path(args.out_dir) / f"sample_{i:03d}.png")
             save_heatmap_png(attn_map, str(Path(args.out_dir) / f"daam_{i:03d}.png"))
+            save_attention_overlay_png(
+                out.images[0],
+                attn_map,
+                str(Path(args.out_dir) / f"daam_overlay_{i:03d}.png"),
+            )
 
         if uncertainty is not None:
             for key in uncertainty_keys:
@@ -195,6 +299,12 @@ def main():
     result = {
         "daam_maps": np.stack(daam_maps).astype(np.float32),
         "daam_words": np.array(words),
+        "daam_words_inferred": np.array(inferred_words),
+        "daam_entropy_norm": np.array(attn_entropy_norm, dtype=np.float32),
+        "daam_effective_area_frac": np.array(attn_effective_area_frac, dtype=np.float32),
+        "daam_top10_mass": np.array(attn_top10_mass, dtype=np.float32),
+        "daam_area50_frac": np.array(attn_area50_frac, dtype=np.float32),
+        "daam_area80_frac": np.array(attn_area80_frac, dtype=np.float32),
         "prompt": np.array(args.prompt),
         "seeds": np.array(seeds, dtype=np.int64),
     }
