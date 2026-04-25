@@ -36,6 +36,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from diffusers import StableDiffusionPipeline, DDIMScheduler, DDPMScheduler
+from diffusers.models.attention_processor import AttnProcessor2_0
 from tqdm import tqdm
 
 
@@ -84,6 +85,24 @@ def get_args():
         default=2,
         help="Monte Carlo weight perturbations per diffusion step for subnet gamma2.",
     )
+    p.add_argument(
+        "--attention_aggregation",
+        type=str,
+        default="none",
+        choices=["none", "cross"],
+        help="Optional attention-aware uncertainty aggregation.",
+    )
+    p.add_argument(
+        "--attention_token_indices",
+        type=str,
+        default="",
+        help="Comma-separated prompt token indices for cross-attention weighting. Empty means all non-special prompt tokens.",
+    )
+    p.add_argument(
+        "--save_attention_maps",
+        action="store_true",
+        help="Store per-sample cross-attention maps in laplace_results.npz.",
+    )
     p.add_argument("--height", type=int, default=512)
     p.add_argument("--width", type=int, default=512)
     p.add_argument("--seed", type=int, default=42)
@@ -107,6 +126,225 @@ def resolve_torch_dtype(dtype_name: str, device: str) -> torch.dtype:
     if dtype_name == "bfloat16":
         return torch.bfloat16
     return torch.float32
+
+
+def parse_token_indices(raw: str) -> list[int]:
+    if not raw.strip():
+        return []
+    return [int(part.strip()) for part in raw.split(",") if part.strip()]
+
+
+def build_attention_token_weights(tokenizer, text_input, token_indices: list[int]):
+    input_ids = text_input.input_ids[0]
+    attn_mask = getattr(text_input, "attention_mask", None)
+    if attn_mask is None:
+        valid = torch.ones_like(input_ids, dtype=torch.bool)
+    else:
+        valid = attn_mask[0].bool()
+
+    weights = torch.zeros_like(input_ids, dtype=torch.float32)
+    if token_indices:
+        for idx in token_indices:
+            if 0 <= idx < weights.numel():
+                weights[idx] = 1.0
+    else:
+        special_ids = set(getattr(tokenizer, "all_special_ids", []))
+        for i, token_id in enumerate(input_ids.tolist()):
+            if valid[i] and token_id not in special_ids:
+                weights[i] = 1.0
+        if weights.sum() == 0:
+            weights[valid] = 1.0
+
+    tokens = tokenizer.convert_ids_to_tokens(input_ids.tolist())
+    used_tokens = [tokens[i] for i, value in enumerate(weights.tolist()) if value > 0]
+    return weights, tokens, used_tokens
+
+
+class CrossAttentionStore:
+    def __init__(self):
+        self.enabled = False
+        self.latent_hw: tuple[int, int] | None = None
+        self.token_weights: torch.Tensor | None = None
+        self._step_maps: list[torch.Tensor] = []
+        self._sample_maps: list[torch.Tensor] = []
+
+    def start_step(self, latent_hw: tuple[int, int], token_weights: torch.Tensor):
+        self.enabled = True
+        self.latent_hw = latent_hw
+        self.token_weights = token_weights
+        self._step_maps = []
+
+    def finish_step(self):
+        self.enabled = False
+        if not self._step_maps:
+            return
+        step_map = torch.stack(self._step_maps).mean(dim=0)
+        self._sample_maps.append(step_map.cpu())
+        self._step_maps = []
+
+    def reset_sample(self):
+        self.enabled = False
+        self._step_maps = []
+        self._sample_maps = []
+
+    def sample_map(self) -> torch.Tensor | None:
+        if not self._sample_maps:
+            return None
+        attn_map = torch.stack(self._sample_maps).mean(dim=0)
+        attn_map = attn_map.clamp_min(0)
+        total = attn_map.sum()
+        if total > 0:
+            attn_map = attn_map / total
+        return attn_map
+
+    def add(self, attn_probs: torch.Tensor):
+        if not self.enabled or self.latent_hw is None or self.token_weights is None:
+            return
+        if attn_probs.ndim != 4:
+            return
+
+        batch, _, query_len, key_len = attn_probs.shape
+        if key_len != self.token_weights.numel():
+            return
+
+        side = int(query_len ** 0.5)
+        if side * side != query_len:
+            return
+
+        cond_idx = 1 if batch > 1 else 0
+        token_weights = self.token_weights.to(
+            device=attn_probs.device, dtype=torch.float32
+        )
+        if token_weights.sum() <= 0:
+            return
+
+        selected = (
+            attn_probs[cond_idx].float()
+            * token_weights.view(1, 1, key_len)
+        ).sum(dim=-1)
+        spatial = selected.mean(dim=0).view(1, 1, side, side)
+        spatial = F.interpolate(
+            spatial,
+            size=self.latent_hw,
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0).squeeze(0)
+        self._step_maps.append(spatial.detach().cpu())
+
+
+class CaptureCrossAttnProcessor:
+    def __init__(self, store: CrossAttentionStore):
+        self.store = store
+
+    def __call__(
+        self,
+        attn,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        temb: torch.Tensor | None = None,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
+
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+        query = attn.to_q(hidden_states)
+
+        is_cross = encoder_hidden_states is not None
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
+
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+
+        scale = getattr(attn, "scale", head_dim ** -0.5)
+        attention_scores = torch.matmul(query, key.transpose(-1, -2)) * scale
+        if attention_mask is not None:
+            attention_scores = attention_scores + attention_mask
+
+        attention_probs = attention_scores.float().softmax(dim=-1).to(query.dtype)
+        if is_cross:
+            self.store.add(attention_probs)
+
+        hidden_states = torch.matmul(attention_probs, value)
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = hidden_states.to(query.dtype)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+        return hidden_states
+
+
+def install_cross_attention_capture(unet, store: CrossAttentionStore):
+    processors = {}
+    for name in unet.attn_processors.keys():
+        if "attn2" in name:
+            processors[name] = CaptureCrossAttnProcessor(store)
+        else:
+            processors[name] = AttnProcessor2_0()
+    unet.set_attn_processor(processors)
+
+
+def attention_weighted_scores(var_map: np.ndarray, attention_map: np.ndarray):
+    var_gray = np.asarray(var_map, dtype=np.float32).mean(axis=0)
+    attn = np.asarray(attention_map, dtype=np.float32)
+    if attn.shape != var_gray.shape:
+        attn_t = torch.from_numpy(attn).view(1, 1, *attn.shape).float()
+        attn = F.interpolate(
+            attn_t,
+            size=var_gray.shape,
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze().numpy()
+    attn = np.clip(attn, 0, None)
+    attn_sum = float(attn.sum())
+    if attn_sum <= 0:
+        attn = np.full_like(var_gray, 1.0 / var_gray.size)
+    else:
+        attn = attn / attn_sum
+    weighted_mean = float((var_gray * attn).sum())
+    weighted_sum = float(weighted_mean * var_gray.size)
+    return weighted_mean, weighted_sum
 
 
 def gamma2_conv2d(
@@ -553,6 +791,7 @@ def sample_with_flare(
     unet, laplace, scheduler, text_emb, uncond_emb, abar,
     latent_shape, steps, guidance_scale, device, seed,
     feat_cap, scheduler_name, laplace_mode, subnet_mc_samples,
+    attention_store=None, attention_token_weights=None,
 ):
     """DDIM sampling with FLARE epistemic uncertainty transport.
 
@@ -577,13 +816,19 @@ def sample_with_flare(
     cum_a2 = torch.ones(1, 1, 1, 1, device=device, dtype=torch.float32)
 
     timesteps = list(scheduler.timesteps)
+    if attention_store is not None:
+        attention_store.reset_sample()
 
     for i, t in enumerate(tqdm(timesteps, desc="  FLARE sample", leave=False)):
         t_int = t.item()
 
         z_in = torch.cat([z, z])
         emb = torch.cat([uncond_emb, text_emb])
+        if attention_store is not None and attention_token_weights is not None:
+            attention_store.start_step(latent_shape[1:], attention_token_weights)
         pred = unet(z_in, t, encoder_hidden_states=emb).sample
+        if attention_store is not None:
+            attention_store.finish_step()
         eu, ec = pred.chunk(2)
         eps = eu + guidance_scale * (ec - eu)
 
@@ -610,7 +855,10 @@ def sample_with_flare(
 
         z = scheduler.step(eps, t, z, generator=gen).prev_sample.to(dtype=latent_dtype)
 
-    return z, Var_proj
+    attention_map = None
+    if attention_store is not None:
+        attention_map = attention_store.sample_map()
+    return z, Var_proj, attention_map
 
 
 def decode_latent(vae, z, device):
@@ -703,14 +951,16 @@ def main():
     tok = pipe.tokenizer
     text_input = tok(
         args.prompt, padding="max_length",
-        max_length=tok.model_max_length, truncation=True, return_tensors="pt",
+        max_length=tok.model_max_length, truncation=True,
+        return_attention_mask=True, return_tensors="pt",
     )
     with torch.no_grad():
         text_emb = pipe.text_encoder(text_input.input_ids.to(device))[0].detach()
 
     uncond_input = tok(
         "", padding="max_length",
-        max_length=tok.model_max_length, truncation=True, return_tensors="pt",
+        max_length=tok.model_max_length, truncation=True,
+        return_attention_mask=True, return_tensors="pt",
     )
     with torch.no_grad():
         uncond_emb = pipe.text_encoder(uncond_input.input_ids.to(device))[0].detach()
@@ -765,20 +1015,38 @@ def main():
     print(f"  Hessian + prior done in {time.time()-t0:.0f}s")
     print(f"  prior_prec = {laplace.prior_prec:.2e}")
 
+    attention_store = None
+    attention_token_weights = None
+    attention_tokens = []
+    attention_all_tokens = []
+    if args.attention_aggregation == "cross":
+        token_indices = parse_token_indices(args.attention_token_indices)
+        attention_token_weights, attention_all_tokens, attention_tokens = build_attention_token_weights(
+            tok, text_input, token_indices
+        )
+        attention_store = CrossAttentionStore()
+        install_cross_attention_capture(unet, attention_store)
+        print("Cross-attention aggregation enabled.")
+        print(f"  Attention tokens: {attention_tokens}")
+
     images = []
     var_maps = []
+    attention_maps = []
     var_mean = []
     var_sum = []
     var_p95 = []
+    var_attn_mean = []
+    var_attn_sum = []
     for i in range(args.n_samples):
         seed = args.seed + 100 + i
         print(f"Sampling image {i+1}/{args.n_samples} (seed={seed})...")
         t0 = time.time()
-        z0, var_proj = sample_with_flare(
+        z0, var_proj, attention_map = sample_with_flare(
             unet, laplace, scheduler, text_emb, uncond_emb, abar,
             latent_shape, args.steps, args.guidance_scale,
             device, seed, feat_cap, args.scheduler,
             args.laplace_mode, args.subnet_mc_samples,
+            attention_store, attention_token_weights,
         )
         print(f"  Done in {time.time()-t0:.0f}s")
 
@@ -789,15 +1057,34 @@ def main():
         var_mean.append(float(var_np.mean()))
         var_sum.append(float(var_np.sum()))
         var_p95.append(float(np.percentile(var_np, 95)))
+        if attention_map is not None:
+            attn_np = attention_map.numpy().astype(np.float32)
+            attention_maps.append(attn_np)
+            attn_mean, attn_sum = attention_weighted_scores(var_np, attn_np)
+            var_attn_mean.append(attn_mean)
+            var_attn_sum.append(attn_sum)
+        else:
+            var_attn_mean.append(np.nan)
+            var_attn_sum.append(np.nan)
+
+    results = {
+        "images": np.stack(images),
+        "var_maps": np.stack(var_maps),
+        "var_mean": np.array(var_mean, dtype=np.float32),
+        "var_sum": np.array(var_sum, dtype=np.float32),
+        "var_p95": np.array(var_p95, dtype=np.float32),
+        "var_attn_mean": np.array(var_attn_mean, dtype=np.float32),
+        "var_attn_sum": np.array(var_attn_sum, dtype=np.float32),
+        "attention_tokens": np.array(attention_tokens),
+        "attention_all_tokens": np.array(attention_all_tokens),
+        "prompt": np.array(args.prompt),
+    }
+    if args.save_attention_maps and attention_maps:
+        results["attention_maps"] = np.stack(attention_maps).astype(np.float32)
 
     np.savez_compressed(
         os.path.join(args.out_dir, "laplace_results.npz"),
-        images=np.stack(images),
-        var_maps=np.stack(var_maps),
-        var_mean=np.array(var_mean, dtype=np.float32),
-        var_sum=np.array(var_sum, dtype=np.float32),
-        var_p95=np.array(var_p95, dtype=np.float32),
-        prompt=np.array(args.prompt),
+        **results,
     )
     print(f"Saved results to {args.out_dir}/laplace_results.npz")
 

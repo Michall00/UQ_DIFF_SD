@@ -1,4 +1,4 @@
-.PHONY: help all sd-sync sd-smoke sd-last-ddim sd-last-ddpm sd-subnet-smoke sd-subnet-ddim sd-subnet-ddpm sd-show
+.PHONY: help all sd-sync sd-smoke sd-last-ddim sd-last-ddpm sd-subnet-smoke sd-subnet-ddim sd-subnet-ddpm sd-eval-ddim sd-benchmark-ddim sd-daam-ddim sd-daam-subnet-ddim sd-daam-show sd-show
 
 MODEL_ID ?= CompVis/stable-diffusion-v1-4
 TINY_MODEL_ID ?= hf-internal-testing/tiny-stable-diffusion-pipe
@@ -19,8 +19,22 @@ N_SAMPLES ?= 8
 SUBNET_N_PARAMS ?= 50000
 SUBNET_MAX_TENSORS ?= 12
 SUBNET_MC_SAMPLES ?= 2
+ATTENTION_AGGREGATION ?= none
+ATTENTION_TOKEN_INDICES ?=
+SAVE_ATTENTION_MAPS ?=
+DAAM_WORDS ?= hand,fingers
+DAAM_PYTHON ?= 3.11
+DAAM_UNCERTAINTY_NPZ ?= assets/stable_diffusion/subnet_ddim/laplace_results.npz
+DAAM_WITH := --python $(DAAM_PYTHON) --with daam==0.2.0 --with huggingface-hub==0.17.3
+EVAL_NPZS ?= assets/stable_diffusion/last_layer_ddim/laplace_results.npz assets/stable_diffusion/subnet_ddim/laplace_results.npz
+EVAL_OUT_DIR ?= assets/stable_diffusion/eval_ddim
+EVAL_CLIP_MODEL ?= openai/clip-vit-base-patch32
+EVAL_BATCH_SIZE ?= 16
+EVAL_FILTER_FRACS ?= 0.1,0.2,0.3
 
 SD_SCRIPT := experiments/stable_diffusion/run_sd_laplace.py
+DAAM_SCRIPT := experiments/stable_diffusion/run_daam_attention.py
+EVAL_SCRIPT := experiments/stable_diffusion/evaluate_sd_uq.py
 
 help:
 	@echo "Stable Diffusion UQ targets:"
@@ -32,14 +46,24 @@ help:
 	@echo "  make sd-subnet-smoke  SD v1.4 small subnet sanity run"
 	@echo "  make sd-subnet-ddim   SD v1.4 random subnet FLARE + DDIM"
 	@echo "  make sd-subnet-ddpm   SD v1.4 random subnet FLARE + DDPM"
+	@echo "  make sd-eval-ddim     evaluate last_layer_ddim and subnet_ddim with CLIPScore"
+	@echo "  make sd-benchmark-ddim  run last/subnet DDIM, then evaluate"
+	@echo "  make sd-daam-ddim     DAAM maps + weighted scores for last_layer_ddim"
+	@echo "  make sd-daam-subnet-ddim  DAAM maps + weighted scores for subnet_ddim"
+	@echo "  make sd-daam-show OUT_DIR=...  print DAAM-weighted ranking"
 	@echo "  make sd-show OUT_DIR=...  print uncertainty ranking from results"
 	@echo ""
 	@echo "Common overrides:"
 	@echo "  make sd-subnet-ddim PROMPT=\"a red cube on a blue sphere\" N_SAMPLES=16"
 	@echo "  make sd-subnet-ddim SUBNET_N_PARAMS=100000 SUBNET_MC_SAMPLES=4"
 	@echo "  make sd-subnet-ddpm STEPS_DDPM=1000"
+	@echo "  make sd-subnet-ddim ATTENTION_AGGREGATION=cross SAVE_ATTENTION_MAPS=--save_attention_maps"
+	@echo "  make sd-benchmark-ddim N_SAMPLES=100"
+	@echo "  make sd-daam-subnet-ddim DAAM_WORDS=hand,fingers"
 
 all: sd-last-ddim sd-last-ddpm sd-subnet-ddim sd-subnet-ddpm
+
+sd-benchmark-ddim: sd-last-ddim sd-subnet-ddim sd-eval-ddim
 
 sd-sync:
 	uv sync --extra stable-diffusion --extra dev
@@ -52,6 +76,7 @@ sd-smoke:
 		--torch_dtype float32 \
 		--scheduler ddim \
 		--laplace_mode last_layer \
+		--attention_aggregation none \
 		--steps 1 \
 		--guidance_scale $(GUIDANCE_SCALE) \
 		--n_z0 1 \
@@ -70,6 +95,9 @@ sd-last-ddim:
 		--torch_dtype $(TORCH_DTYPE) \
 		--scheduler ddim \
 		--laplace_mode last_layer \
+		--attention_aggregation $(ATTENTION_AGGREGATION) \
+		--attention_token_indices "$(ATTENTION_TOKEN_INDICES)" \
+		$(SAVE_ATTENTION_MAPS) \
 		--steps $(STEPS_DDIM) \
 		--guidance_scale $(GUIDANCE_SCALE) \
 		--n_z0 $(N_Z0) \
@@ -88,6 +116,9 @@ sd-last-ddpm:
 		--torch_dtype $(TORCH_DTYPE) \
 		--scheduler ddpm \
 		--laplace_mode last_layer \
+		--attention_aggregation $(ATTENTION_AGGREGATION) \
+		--attention_token_indices "$(ATTENTION_TOKEN_INDICES)" \
+		$(SAVE_ATTENTION_MAPS) \
 		--steps $(STEPS_DDPM) \
 		--guidance_scale $(GUIDANCE_SCALE) \
 		--n_z0 $(N_Z0) \
@@ -106,6 +137,9 @@ sd-subnet-smoke:
 		--torch_dtype $(TORCH_DTYPE) \
 		--scheduler ddim \
 		--laplace_mode subnet \
+		--attention_aggregation $(ATTENTION_AGGREGATION) \
+		--attention_token_indices "$(ATTENTION_TOKEN_INDICES)" \
+		$(SAVE_ATTENTION_MAPS) \
 		--steps 20 \
 		--guidance_scale $(GUIDANCE_SCALE) \
 		--n_z0 2 \
@@ -127,6 +161,9 @@ sd-subnet-ddim:
 		--torch_dtype $(TORCH_DTYPE) \
 		--scheduler ddim \
 		--laplace_mode subnet \
+		--attention_aggregation $(ATTENTION_AGGREGATION) \
+		--attention_token_indices "$(ATTENTION_TOKEN_INDICES)" \
+		$(SAVE_ATTENTION_MAPS) \
 		--steps $(STEPS_DDIM) \
 		--guidance_scale $(GUIDANCE_SCALE) \
 		--n_z0 $(N_Z0) \
@@ -148,6 +185,9 @@ sd-subnet-ddpm:
 		--torch_dtype $(TORCH_DTYPE) \
 		--scheduler ddpm \
 		--laplace_mode subnet \
+		--attention_aggregation $(ATTENTION_AGGREGATION) \
+		--attention_token_indices "$(ATTENTION_TOKEN_INDICES)" \
+		$(SAVE_ATTENTION_MAPS) \
 		--steps $(STEPS_DDPM) \
 		--guidance_scale $(GUIDANCE_SCALE) \
 		--n_z0 $(N_Z0) \
@@ -161,5 +201,52 @@ sd-subnet-ddpm:
 		--seed $(SEED) \
 		--out_dir assets/stable_diffusion/subnet_ddpm
 
+sd-eval-ddim:
+	uv run python $(EVAL_SCRIPT) \
+		--results $(EVAL_NPZS) \
+		--out_dir "$(EVAL_OUT_DIR)" \
+		--clip_model "$(EVAL_CLIP_MODEL)" \
+		--device $(DEVICE) \
+		--torch_dtype $(TORCH_DTYPE) \
+		--batch_size $(EVAL_BATCH_SIZE) \
+		--filter_fracs "$(EVAL_FILTER_FRACS)"
+
+sd-daam-ddim:
+	uv run $(DAAM_WITH) python $(DAAM_SCRIPT) \
+		--model_id "$(MODEL_ID)" \
+		--prompt "$(PROMPT)" \
+		--words "$(DAAM_WORDS)" \
+		--device $(DEVICE) \
+		--torch_dtype $(TORCH_DTYPE) \
+		--scheduler ddim \
+		--steps $(STEPS_DDIM) \
+		--guidance_scale $(GUIDANCE_SCALE) \
+		--n_samples $(N_SAMPLES) \
+		--height $(HEIGHT) \
+		--width $(WIDTH) \
+		--seed $(SEED) \
+		--uncertainty_npz assets/stable_diffusion/last_layer_ddim/laplace_results.npz \
+		--out_dir assets/stable_diffusion/daam_last_layer_ddim
+
+sd-daam-subnet-ddim:
+	uv run $(DAAM_WITH) python $(DAAM_SCRIPT) \
+		--model_id "$(MODEL_ID)" \
+		--prompt "$(PROMPT)" \
+		--words "$(DAAM_WORDS)" \
+		--device $(DEVICE) \
+		--torch_dtype $(TORCH_DTYPE) \
+		--scheduler ddim \
+		--steps $(STEPS_DDIM) \
+		--guidance_scale $(GUIDANCE_SCALE) \
+		--n_samples $(N_SAMPLES) \
+		--height $(HEIGHT) \
+		--width $(WIDTH) \
+		--seed $(SEED) \
+		--uncertainty_npz "$(DAAM_UNCERTAINTY_NPZ)" \
+		--out_dir assets/stable_diffusion/daam_subnet_ddim
+
 sd-show:
 	uv run python -c "import numpy as np; p='$(OUT_DIR)/laplace_results.npz'; d=np.load(p); order=np.argsort(d['var_mean']); print('file:', p); print('least uncertain:', order[:10], d['var_mean'][order[:10]]); print('most uncertain:', order[-10:][::-1], d['var_mean'][order[-10:][::-1]])"
+
+sd-daam-show:
+	uv run python -c "import numpy as np; p='$(OUT_DIR)/daam_results.npz'; d=np.load(p); order=np.argsort(d['daam_var_mean']); print('file:', p); print('words:', d['daam_words']); print('least uncertain:', order[:10], d['daam_var_mean'][order[:10]]); print('most uncertain:', order[-10:][::-1], d['daam_var_mean'][order[-10:][::-1]])"
