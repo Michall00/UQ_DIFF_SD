@@ -73,7 +73,7 @@ def resolve_torch_dtype(dtype_name: str, device: str) -> torch.dtype:
 def parse_words(raw: str) -> list[str]:
     words = [word.strip() for word in raw.split(",") if word.strip()]
     if not words:
-        raise ValueError("--words must contain at least one comma-separated word")
+        raise ValueError("Could not infer DAAM words from prompt. Pass --words explicitly.")
     return words
 
 

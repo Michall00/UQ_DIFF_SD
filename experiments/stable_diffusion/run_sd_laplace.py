@@ -924,10 +924,18 @@ def sample_with_flare(
 
 
 def decode_latent(vae, z, device):
-    z = z / vae.config.scaling_factor
-    img = vae.decode(z.to(device)).sample
+    vae_dtype = next(vae.parameters()).dtype
+    decode_dtype = torch.float32 if getattr(vae.config, "force_upcast", False) else vae_dtype
+    if vae_dtype in (torch.float16, torch.bfloat16) and z.shape[-1] >= 128:
+        decode_dtype = torch.float32
+    if vae_dtype != decode_dtype:
+        vae.to(dtype=decode_dtype)
+
+    z = z.to(device=device, dtype=decode_dtype) / vae.config.scaling_factor
+    img = vae.decode(z).sample
     img = (img / 2 + 0.5).clamp(0, 1)
-    return img.detach().float().cpu().permute(0, 2, 3, 1).numpy()[0]
+    img = img.detach().float().cpu().permute(0, 2, 3, 1).numpy()[0]
+    return np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
 
 
 def main():

@@ -11,6 +11,28 @@ from matplotlib import pyplot as plt
 from sd_uq.aggregation import latent_gray
 
 
+def _as_rgb_float(image) -> np.ndarray:
+    arr = np.asarray(image)
+    if arr.ndim == 4 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+        arr = np.moveaxis(arr, 0, -1)
+    if arr.ndim == 2:
+        arr = np.repeat(arr[..., None], 3, axis=-1)
+    if arr.ndim != 3:
+        raise ValueError(f"Expected image with 2 or 3 dimensions, got shape {arr.shape}.")
+    if arr.shape[-1] == 1:
+        arr = np.repeat(arr, 3, axis=-1)
+    elif arr.shape[-1] > 3:
+        arr = arr[..., :3]
+
+    arr = arr.astype(np.float32, copy=False)
+    finite = arr[np.isfinite(arr)]
+    if finite.size and finite.max() > 1.0:
+        arr = arr / 255.0
+    return np.nan_to_num(np.clip(arr, 0.0, 1.0), nan=0.0, posinf=1.0, neginf=0.0)
+
+
 def save_heatmap_png(attn_map: np.ndarray, path: str):
     plt.figure(figsize=(5, 5))
     plt.imshow(attn_map, cmap="magma")
@@ -32,7 +54,7 @@ def plot_results(images, var_maps, prompt, out_dir, max_samples=16, filename="sd
     fig.suptitle(f'Laplace-FLARE UQ — "{prompt}"', fontsize=13, y=0.98)
 
     for i in range(n):
-        image = np.asarray(images[i], dtype=np.float32)
+        image = _as_rgb_float(images[i])
         var_gray = latent_gray(var_maps[i])
 
         axes[0, i].imshow(image)
@@ -47,7 +69,7 @@ def plot_results(images, var_maps, prompt, out_dir, max_samples=16, filename="sd
         std_up = np.array(
             torch.nn.functional.interpolate(
                 torch.from_numpy(var_gray).unsqueeze(0).unsqueeze(0).float(),
-                size=images[i].shape[:2],
+                size=image.shape[:2],
                 mode="bilinear",
                 align_corners=False,
             ).squeeze()
@@ -66,4 +88,3 @@ def plot_results(images, var_maps, prompt, out_dir, max_samples=16, filename="sd
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved plot to {path}")
-
