@@ -78,4 +78,44 @@ W praktyce `laplace-torch` **nie wspiera Conv2d jako ostatniej warstwy w trybie 
 
 ## 5. Ograniczenia
 
-- Obejmujemy tylko **conv_out** (11.5K z 860M params = 0.001%) → niepewność jest **dolnym ograniczeniem** prawdziwej epistemicznej niepewności
+- W trybie `--laplace_mode last_layer` obejmujemy tylko **conv_out** (11.5K z 860M params = 0.001%) → niepewność jest **dolnym ograniczeniem** prawdziwej epistemicznej niepewności
+- W trybie `--laplace_mode subnet` obejmujemy parametry z wielu bloków UNeta, ale nadal jest to diagonalna aproksymacja oraz estymacja Monte Carlo, a nie pełny Hessian z artykułu.
+
+## 6. Rozszerzenie: losowy subnet UNeta
+
+Dodany został tryb `--laplace_mode subnet`, który nie ogranicza Laplace'a do `conv_out`.
+Skrypt wybiera losowe tensory parametrów z różnych części UNeta (`conv_in`,
+`time_embedding`, `down_blocks`, `mid_block`, `up_blocks`) i fituje diagonalny
+posterior na wybranych skalarnych parametrach.
+
+W czasie samplowania `gamma²_t` jest estymowane przez perturbacje wag:
+
+1. próbkujemy kilka perturbacji wybranego subnetu z diagonalnego posteriora,
+2. wykonujemy dodatkowe forward passy UNeta,
+3. liczymy wariancję zmiany predykcji CFG `eps_theta`,
+4. tę mapę traktujemy jako `diag(J Sigma J^T)` i propagujemy przez FLARE.
+
+To jest praktyczny odpowiednik idei randomized subnetwork FLARE dla Stable
+Diffusion. Nie liczymy pełnego Hessianu ani pełnych per-pixel Jacobianów, bo dla
+UNeta SD byłoby to zbyt kosztowne. W zamian dostajemy network-wide signal:
+niepewność zależy od parametrów z wielu bloków modelu, nie tylko od ostatniej
+konwolucji.
+
+## 7. DAAM jako attention-weighted aggregation
+
+Dodany został osobny skrypt `run_daam_attention.py`, który używa DAAM do
+wyznaczania cross-attention heatmap dla wybranych słów promptu, a następnie
+może zważyć zapisane wcześniej mapy niepewności z `laplace_results.npz`.
+
+Metryka:
+
+$$U_{\text{DAAM}} = \sum_{x,y} A_{\text{DAAM}}(x,y) \cdot U(x,y)$$
+
+gdzie `A_DAAM` jest znormalizowaną mapą istotności słowa/promptu, a `U` jest
+mapą niepewności. Dzięki temu agregacja nie traktuje tła i prompt-relevant
+regionów tak samo.
+
+Uwaga techniczna: oficjalny pakiet DAAM pinuje starsze wersje `diffusers` i
+`transformers`, dlatego jest uruchamiany przez osobne targety Makefile z
+kompatybilnym środowiskiem `uv run --with daam==0.2.0 ...`, a nie jako część
+głównego `stable-diffusion` extra.

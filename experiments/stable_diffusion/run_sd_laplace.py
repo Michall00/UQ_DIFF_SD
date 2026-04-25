@@ -29,21 +29,25 @@ from __future__ import annotations
 import argparse
 import os
 import time
-from dataclasses import dataclass
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
-from diffusers import (
-    StableDiffusionPipeline,
-    StableDiffusionXLPipeline,
-    DDIMScheduler,
-    DDPMScheduler,
-)
+from diffusers import DDIMScheduler, DDPMScheduler
 from diffusers.models.attention_processor import AttnProcessor2_0
 from tqdm import tqdm
+
+from sd_uq.aggregation import attention_weighted_scores, uncertainty_stats
+from sd_uq.pipelines import (
+    DiffusionConditioning,
+    cfg_embeddings,
+    encode_conditioning,
+    infer_pipeline_family,
+    load_pipeline,
+    resolve_torch_dtype,
+)
+from sd_uq.plotting import plot_results
 
 
 def get_args():
@@ -79,6 +83,22 @@ def get_args():
         default="last_layer",
         choices=["last_layer", "subnet"],
         help="Use conv_out LLLA or a random network-wide UNet subnetwork.",
+    )
+    p.add_argument(
+        "--uq_method",
+        type=str,
+        default="flare",
+        choices=["flare", "bayesdiff", "both"],
+        help=(
+            "Uncertainty recursion to save. bayesdiff is a Stable Diffusion "
+            "adaptation without the expensive BayesDiff covariance term."
+        ),
+    )
+    p.add_argument(
+        "--bayesdiff_include_t4",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include DDPM sampler variance term in bayesdiff_var_maps when available.",
     )
     p.add_argument(
         "--subnet_n_params",
@@ -137,49 +157,10 @@ def get_args():
     return p.parse_args()
 
 
-def resolve_torch_dtype(dtype_name: str, device: str) -> torch.dtype:
-    if dtype_name == "auto":
-        return torch.float16 if device.startswith("cuda") else torch.float32
-    if dtype_name == "float16":
-        return torch.float16
-    if dtype_name == "bfloat16":
-        return torch.bfloat16
-    return torch.float32
-
-
 def parse_token_indices(raw: str) -> list[int]:
     if not raw.strip():
         return []
     return [int(part.strip()) for part in raw.split(",") if part.strip()]
-
-
-@dataclass
-class DiffusionConditioning:
-    text_emb: torch.Tensor
-    uncond_emb: torch.Tensor
-    cond_kwargs: dict[str, torch.Tensor] | None = None
-    uncond_kwargs: dict[str, torch.Tensor] | None = None
-
-    def cond_forward_kwargs(self) -> dict[str, dict[str, torch.Tensor]]:
-        if not self.cond_kwargs:
-            return {}
-        return {"added_cond_kwargs": self.cond_kwargs}
-
-    def cfg_forward_kwargs(self) -> dict[str, dict[str, torch.Tensor]]:
-        if not self.cond_kwargs:
-            return {}
-        if not self.uncond_kwargs:
-            raise ValueError("CFG conditioning requires unconditional added kwargs.")
-        return {
-            "added_cond_kwargs": {
-                key: torch.cat([self.uncond_kwargs[key], value], dim=0)
-                for key, value in self.cond_kwargs.items()
-            }
-        }
-
-
-def cfg_embeddings(cond: DiffusionConditioning) -> torch.Tensor:
-    return torch.cat([cond.uncond_emb, cond.text_emb])
 
 
 def build_attention_token_weights(tokenizer, text_input, token_indices: list[int]):
@@ -373,28 +354,6 @@ def install_cross_attention_capture(unet, store: CrossAttentionStore):
     unet.set_attn_processor(processors)
 
 
-def attention_weighted_scores(var_map: np.ndarray, attention_map: np.ndarray):
-    var_gray = np.asarray(var_map, dtype=np.float32).mean(axis=0)
-    attn = np.asarray(attention_map, dtype=np.float32)
-    if attn.shape != var_gray.shape:
-        attn_t = torch.from_numpy(attn).view(1, 1, *attn.shape).float()
-        attn = F.interpolate(
-            attn_t,
-            size=var_gray.shape,
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze().numpy()
-    attn = np.clip(attn, 0, None)
-    attn_sum = float(attn.sum())
-    if attn_sum <= 0:
-        attn = np.full_like(var_gray, 1.0 / var_gray.size)
-    else:
-        attn = attn / attn_sum
-    weighted_mean = float((var_gray * attn).sum())
-    weighted_sum = float(weighted_mean * var_gray.size)
-    return weighted_mean, weighted_sum
-
-
 def gamma2_conv2d(
     features: torch.Tensor,
     posterior_var: torch.Tensor,
@@ -478,6 +437,19 @@ def ddpm_transport_coeffs(
     a = pred_x0_coeff / alpha_prod_t.sqrt().clamp_min(1e-12) + current_sample_coeff
     b = -pred_x0_coeff * beta_prod_t.sqrt() / alpha_prod_t.sqrt().clamp_min(1e-12)
     return a, b
+
+
+def ddpm_sampler_variance(
+    scheduler,
+    t: int,
+    like: torch.Tensor,
+) -> torch.Tensor:
+    if not hasattr(scheduler, "_get_variance"):
+        return torch.zeros_like(like, dtype=torch.float32)
+    variance = scheduler._get_variance(t)
+    if not isinstance(variance, torch.Tensor):
+        variance = torch.tensor(variance, device=like.device)
+    return variance.to(device=like.device, dtype=torch.float32).view(1, 1, 1, 1).expand_as(like)
 
 
 def _subnet_group_name(param_name: str) -> str:
@@ -854,6 +826,7 @@ def sample_with_flare(
     unet, laplace, scheduler, cond, abar,
     latent_shape, steps, guidance_scale, device, seed,
     feat_cap, scheduler_name, laplace_mode, subnet_mc_samples,
+    uq_method="flare", bayesdiff_include_t4=True,
     attention_store=None, attention_token_weights=None,
 ):
     """DDIM sampling with FLARE epistemic uncertainty transport.
@@ -865,7 +838,12 @@ def sample_with_flare(
     4. Accumulate: Var_proj += cum_a2 * b_t^2 * gamma2_t; cum_a2 *= a_t^2
     5. Execute DDIM step
 
-    Returns (z0, Var_proj) where Var_proj is the accumulated epistemic variance.
+    Returns (z0, uq_maps, attention_map).
+
+    uq_maps["var_proj"] is the FLARE epistemic projection.
+    uq_maps["bayesdiff_var"] is a BayesDiff-style variance recursion adapted to
+    SD latents. It includes t1+t3 and, for DDPM, optional t4 sampler variance.
+    The expensive BayesDiff covariance term t2 is intentionally omitted.
     """
     scheduler.set_timesteps(steps)
     gen = torch.Generator(device=device).manual_seed(seed)
@@ -875,7 +853,10 @@ def sample_with_flare(
         1, *latent_shape, device=device, dtype=latent_dtype, generator=gen
     )
 
-    Var_proj = torch.zeros_like(z, dtype=torch.float32)
+    use_flare = uq_method in {"flare", "both"}
+    use_bayesdiff = uq_method in {"bayesdiff", "both"}
+    Var_proj = torch.zeros_like(z, dtype=torch.float32) if use_flare else None
+    Var_bayesdiff = torch.zeros_like(z, dtype=torch.float32) if use_bayesdiff else None
     cum_a2 = torch.ones(1, 1, 1, 1, device=device, dtype=torch.float32)
 
     timesteps = list(scheduler.timesteps)
@@ -917,15 +898,29 @@ def sample_with_flare(
         else:
             raise ValueError(f"Unsupported scheduler: {scheduler_name}")
 
-        Var_proj = Var_proj + cum_a2 * (b ** 2) * gamma2_t
-        cum_a2 = cum_a2 * (a ** 2)
+        if use_flare:
+            Var_proj = Var_proj + cum_a2 * (b ** 2) * gamma2_t
+            cum_a2 = cum_a2 * (a ** 2)
+
+        if use_bayesdiff:
+            Var_bayesdiff = (a ** 2) * Var_bayesdiff + (b ** 2) * gamma2_t
+            if bayesdiff_include_t4 and scheduler_name == "ddpm":
+                Var_bayesdiff = Var_bayesdiff + ddpm_sampler_variance(
+                    scheduler, t_int, Var_bayesdiff
+                )
+            Var_bayesdiff = Var_bayesdiff.clamp_min(0)
 
         z = scheduler.step(eps, t, z, generator=gen).prev_sample.to(dtype=latent_dtype)
 
     attention_map = None
     if attention_store is not None:
         attention_map = attention_store.sample_map()
-    return z, Var_proj, attention_map
+    uq_maps = {}
+    if use_flare:
+        uq_maps["var_proj"] = Var_proj
+    if use_bayesdiff:
+        uq_maps["bayesdiff_var"] = Var_bayesdiff
+    return z, uq_maps, attention_map
 
 
 def decode_latent(vae, z, device):
@@ -933,126 +928,6 @@ def decode_latent(vae, z, device):
     img = vae.decode(z.to(device)).sample
     img = (img / 2 + 0.5).clamp(0, 1)
     return img.detach().float().cpu().permute(0, 2, 3, 1).numpy()[0]
-
-
-def infer_pipeline_family(model_id: str, requested: str) -> str:
-    if requested != "auto":
-        return requested
-    lower = model_id.lower()
-    if "sdxl" in lower or "xl" in lower:
-        return "sdxl"
-    return "sd"
-
-
-def load_pipeline(model_id: str, family: str, torch_dtype: torch.dtype):
-    pipeline_cls = StableDiffusionXLPipeline if family == "sdxl" else StableDiffusionPipeline
-    return pipeline_cls.from_pretrained(model_id, torch_dtype=torch_dtype)
-
-
-def encode_conditioning(pipe, family: str, prompt: str, height: int, width: int, device: str):
-    if family == "sdxl":
-        with torch.no_grad():
-            (
-                prompt_embeds,
-                negative_prompt_embeds,
-                pooled_prompt_embeds,
-                negative_pooled_prompt_embeds,
-            ) = pipe.encode_prompt(
-                prompt=prompt,
-                device=device,
-                num_images_per_prompt=1,
-                do_classifier_free_guidance=True,
-                negative_prompt="",
-            )
-        original_size = (height, width)
-        target_size = (height, width)
-        crops_coords_top_left = (0, 0)
-        projection_dim = pipe.text_encoder_2.config.projection_dim
-        add_time_ids = pipe._get_add_time_ids(
-            original_size,
-            crops_coords_top_left,
-            target_size,
-            dtype=prompt_embeds.dtype,
-            text_encoder_projection_dim=projection_dim,
-        ).to(device)
-        return DiffusionConditioning(
-            text_emb=prompt_embeds.detach(),
-            uncond_emb=negative_prompt_embeds.detach(),
-            cond_kwargs={
-                "text_embeds": pooled_prompt_embeds.detach(),
-                "time_ids": add_time_ids,
-            },
-            uncond_kwargs={
-                "text_embeds": negative_pooled_prompt_embeds.detach(),
-                "time_ids": add_time_ids,
-            },
-        ), None, None
-
-    tok = pipe.tokenizer
-    text_input = tok(
-        prompt, padding="max_length",
-        max_length=tok.model_max_length, truncation=True,
-        return_attention_mask=True, return_tensors="pt",
-    )
-    with torch.no_grad():
-        text_emb = pipe.text_encoder(text_input.input_ids.to(device))[0].detach()
-
-    uncond_input = tok(
-        "", padding="max_length",
-        max_length=tok.model_max_length, truncation=True,
-        return_attention_mask=True, return_tensors="pt",
-    )
-    with torch.no_grad():
-        uncond_emb = pipe.text_encoder(uncond_input.input_ids.to(device))[0].detach()
-
-    return DiffusionConditioning(text_emb=text_emb, uncond_emb=uncond_emb), tok, text_input
-
-
-def plot_results(images, var_maps, prompt, out_dir, max_samples=16):
-    if max_samples <= 0:
-        print("Skipping plot (--plot_max_samples <= 0).")
-        return
-    n = min(len(images), max_samples)
-    fig, axes = plt.subplots(3, n, figsize=(5 * n, 14))
-    if n == 1:
-        axes = axes[:, None]
-
-    fig.suptitle(f'Laplace-FLARE UQ — "{prompt}"', fontsize=13, y=0.98)
-
-    for i in range(n):
-        image = np.asarray(images[i], dtype=np.float32)
-        var_map = np.asarray(var_maps[i], dtype=np.float32)
-
-        axes[0, i].imshow(image)
-        axes[0, i].set_title(f"Sample {i+1}")
-        axes[0, i].axis("off")
-
-        var_gray = var_map.mean(axis=0).astype(np.float32)
-        im = axes[1, i].imshow(var_gray, cmap="hot", interpolation="bilinear")
-        axes[1, i].set_title(f"γ² FLARE (latent)")
-        axes[1, i].axis("off")
-        plt.colorbar(im, ax=axes[1, i], fraction=0.046)
-
-        std_up = np.array(
-            torch.nn.functional.interpolate(
-                torch.from_numpy(var_gray).unsqueeze(0).unsqueeze(0).float(),
-                size=images[i].shape[:2], mode="bilinear", align_corners=False,
-            ).squeeze()
-        )
-        std_norm = (std_up / (std_up.max() + 1e-10)).astype(np.float32)
-        overlay = image.copy()
-        red = np.zeros_like(overlay)
-        red[:, :, 0] = std_norm
-        overlay = np.clip(0.6 * overlay + 0.4 * red, 0, 1).astype(np.float32)
-        axes[2, i].imshow(overlay)
-        axes[2, i].set_title("Image + uncertainty overlay")
-        axes[2, i].axis("off")
-
-    plt.tight_layout()
-    path = os.path.join(out_dir, "sd_laplace_flare.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved plot to {path}")
 
 
 def main():
@@ -1169,32 +1044,51 @@ def main():
 
     images = []
     var_maps = []
+    bayesdiff_var_maps = []
     attention_maps = []
     var_mean = []
     var_sum = []
     var_p95 = []
+    bayesdiff_var_mean = []
+    bayesdiff_var_sum = []
+    bayesdiff_var_p95 = []
     var_attn_mean = []
     var_attn_sum = []
     for i in range(args.n_samples):
         seed = args.seed + 100 + i
         print(f"Sampling image {i+1}/{args.n_samples} (seed={seed})...")
         t0 = time.time()
-        z0, var_proj, attention_map = sample_with_flare(
+        z0, uq_maps, attention_map = sample_with_flare(
             unet, laplace, scheduler, cond, abar,
             latent_shape, args.steps, args.guidance_scale,
             device, seed, feat_cap, args.scheduler,
             args.laplace_mode, args.subnet_mc_samples,
+            args.uq_method, args.bayesdiff_include_t4,
             attention_store, attention_token_weights,
         )
         print(f"  Done in {time.time()-t0:.0f}s")
 
         img = decode_latent(vae, z0, device)
-        var_np = var_proj.squeeze(0).detach().cpu().numpy()
+        if "var_proj" in uq_maps:
+            var_tensor = uq_maps["var_proj"]
+        else:
+            var_tensor = uq_maps["bayesdiff_var"]
+        var_np = var_tensor.squeeze(0).detach().cpu().numpy()
         images.append(img)
         var_maps.append(var_np)
-        var_mean.append(float(var_np.mean()))
-        var_sum.append(float(var_np.sum()))
-        var_p95.append(float(np.percentile(var_np, 95)))
+        stats = uncertainty_stats(var_np)
+        var_mean.append(stats["mean"])
+        var_sum.append(stats["sum"])
+        var_p95.append(stats["p95"])
+
+        if "bayesdiff_var" in uq_maps:
+            bayesdiff_np = uq_maps["bayesdiff_var"].squeeze(0).detach().cpu().numpy()
+            bayesdiff_var_maps.append(bayesdiff_np)
+            bayesdiff_stats = uncertainty_stats(bayesdiff_np)
+            bayesdiff_var_mean.append(bayesdiff_stats["mean"])
+            bayesdiff_var_sum.append(bayesdiff_stats["sum"])
+            bayesdiff_var_p95.append(bayesdiff_stats["p95"])
+
         if attention_map is not None:
             attn_np = attention_map.numpy().astype(np.float32)
             attention_maps.append(attn_np)
@@ -1216,7 +1110,14 @@ def main():
         "attention_tokens": np.array(attention_tokens),
         "attention_all_tokens": np.array(attention_all_tokens),
         "prompt": np.array(args.prompt),
+        "uq_method": np.array(args.uq_method),
+        "bayesdiff_include_t4": np.array(args.bayesdiff_include_t4),
     }
+    if bayesdiff_var_maps:
+        results["bayesdiff_var_maps"] = np.stack(bayesdiff_var_maps)
+        results["bayesdiff_var_mean"] = np.array(bayesdiff_var_mean, dtype=np.float32)
+        results["bayesdiff_var_sum"] = np.array(bayesdiff_var_sum, dtype=np.float32)
+        results["bayesdiff_var_p95"] = np.array(bayesdiff_var_p95, dtype=np.float32)
     if args.save_attention_maps and attention_maps:
         results["attention_maps"] = np.stack(attention_maps).astype(np.float32)
 

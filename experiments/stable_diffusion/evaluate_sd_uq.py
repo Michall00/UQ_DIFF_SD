@@ -233,6 +233,16 @@ def uncertainty_metrics(data) -> dict[str, np.ndarray]:
         value = np.asarray(data["var_attn_sum"], dtype=np.float32)
         if np.isfinite(value).any():
             metrics["var_attn_sum"] = value
+    for key in data.files:
+        if key == "var_maps" or not key.endswith("_var_maps"):
+            continue
+        prefix = key[:-5]
+        maps = np.asarray(data[key], dtype=np.float32)
+        maps_flat = maps.reshape(maps.shape[0], -1)
+        metrics[f"{prefix}_mean"] = maps_flat.mean(axis=1).astype(np.float32)
+        metrics[f"{prefix}_sum"] = maps_flat.sum(axis=1).astype(np.float32)
+        metrics[f"{prefix}_p95"] = np.percentile(maps_flat, 95, axis=1).astype(np.float32)
+        metrics[f"{prefix}_max"] = maps_flat.max(axis=1).astype(np.float32)
     return metrics
 
 
@@ -291,7 +301,14 @@ def write_csv(path: Path, rows: list[dict[str, object]]):
 
 
 def write_markdown(path: Path, rows: list[dict[str, object]]):
-    primary = [r for r in rows if r["uncertainty_metric"] in {"var_mean", "var_p95", "var_attn_mean"}]
+    primary_names = {
+        "var_mean",
+        "var_p95",
+        "var_attn_mean",
+        "bayesdiff_var_mean",
+        "bayesdiff_var_p95",
+    }
+    primary = [r for r in rows if r["uncertainty_metric"] in primary_names]
     if not primary:
         primary = rows
     columns = [

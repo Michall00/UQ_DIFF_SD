@@ -1,4 +1,4 @@
-.PHONY: help all sd-sync sd-smoke sd-last-ddim sd-last-ddpm sd-subnet-smoke sd-subnet-ddim sd-subnet-ddpm sd-eval-ddim sd-benchmark-ddim sdxl-last-ddim sdxl-subnet-ddim sdxl-eval-ddim sdxl-benchmark-ddim sd-daam-ddim sd-daam-subnet-ddim sd-daam-show sd-show
+.PHONY: help all all-daam sd-sync sd-smoke sd-last-ddim sd-last-ddpm sd-subnet-smoke sd-subnet-ddim sd-subnet-ddpm sd-eval-ddim sd-benchmark-ddim sdxl-last-ddim sdxl-subnet-ddim sdxl-eval-ddim sdxl-benchmark-ddim sd-daam-ddim sd-daam-subnet-ddim sd-daam-bayesdiff-ddim sd-daam-bayesdiff-ddpm sd-daam-bayesdiff-subnet-ddim sd-daam-bayesdiff-subnet-ddpm sd-daam-show sd-show
 
 MODEL_ID ?= CompVis/stable-diffusion-v1-4
 SDXL_MODEL_ID ?= stabilityai/stable-diffusion-xl-base-1.0
@@ -29,6 +29,9 @@ SAVE_ATTENTION_MAPS ?=
 DAAM_WORDS ?= hand,fingers
 DAAM_PYTHON ?= 3.11
 DAAM_UNCERTAINTY_NPZ ?= assets/stable_diffusion/subnet_ddim/laplace_results.npz
+DAAM_UNCERTAINTY_KEYS ?= var_maps
+DAAM_BAYESDIFF_OUT_DIR ?= assets/stable_diffusion/daam_bayesdiff
+DAAM_SCORE_KEY ?= daam_var_mean
 DAAM_WITH := --python $(DAAM_PYTHON) --with daam==0.2.0 --with huggingface-hub==0.17.3
 EVAL_NPZS ?= assets/stable_diffusion/last_layer_ddim/laplace_results.npz assets/stable_diffusion/subnet_ddim/laplace_results.npz
 EVAL_OUT_DIR ?= assets/stable_diffusion/eval_ddim
@@ -40,11 +43,13 @@ EVAL_FILTER_FRACS ?= 0.1,0.2,0.3
 
 SD_SCRIPT := experiments/stable_diffusion/run_sd_laplace.py
 DAAM_SCRIPT := experiments/stable_diffusion/run_daam_attention.py
+DAAM_BAYESDIFF_SCRIPT := experiments/stable_diffusion/run_daam_bayesdiff_pipeline.py
 EVAL_SCRIPT := experiments/stable_diffusion/evaluate_sd_uq.py
 
 help:
 	@echo "Stable Diffusion UQ targets:"
-	@echo "  make all              run all non-smoke SD experiments"
+	@echo "  make all              run all non-smoke SD + DAAM/BayesDiff experiments"
+	@echo "  make all-daam         run all DAAM/BayesDiff experiments"
 	@echo "  make sd-sync          install SD dependencies via uv"
 	@echo "  make sd-smoke         tiny CPU last-layer smoke test"
 	@echo "  make sd-last-ddim     SD v1.4 conv_out LLLA + DDIM"
@@ -59,6 +64,10 @@ help:
 	@echo "  make sdxl-benchmark-ddim  run SDXL last/subnet DDIM, then evaluate"
 	@echo "  make sd-daam-ddim     DAAM maps + weighted scores for last_layer_ddim"
 	@echo "  make sd-daam-subnet-ddim  DAAM maps + weighted scores for subnet_ddim"
+	@echo "  make sd-daam-bayesdiff-ddim  run FLARE+BayesDiff maps, then DAAM weighting"
+	@echo "  make sd-daam-bayesdiff-ddpm  same with DDPM t4 sampler variance"
+	@echo "  make sd-daam-bayesdiff-subnet-ddim  same, using random subnet gamma2"
+	@echo "  make sd-daam-bayesdiff-subnet-ddpm  subnet version with DDPM"
 	@echo "  make sd-daam-show OUT_DIR=...  print DAAM-weighted ranking"
 	@echo "  make sd-show OUT_DIR=...  print uncertainty ranking from results"
 	@echo ""
@@ -70,8 +79,11 @@ help:
 	@echo "  make sd-benchmark-ddim N_SAMPLES=100"
 	@echo "  make sdxl-benchmark-ddim PROMPT=\"a soccer match in a packed stadium\" N_SAMPLES=50"
 	@echo "  make sd-daam-subnet-ddim DAAM_WORDS=hand,fingers"
+	@echo "  make sd-daam-bayesdiff-ddim DAAM_WORDS=player,ball N_SAMPLES=16"
 
-all: sd-last-ddim sd-last-ddpm sd-subnet-ddim sd-subnet-ddpm
+all: sd-last-ddim sd-last-ddpm sd-subnet-ddim sd-subnet-ddpm all-daam
+
+all-daam: sd-daam-bayesdiff-ddim sd-daam-bayesdiff-ddpm sd-daam-bayesdiff-subnet-ddim sd-daam-bayesdiff-subnet-ddpm
 
 sd-benchmark-ddim: sd-last-ddim sd-subnet-ddim sd-eval-ddim
 
@@ -299,6 +311,7 @@ sd-daam-ddim:
 		--width $(WIDTH) \
 		--seed $(SEED) \
 		--uncertainty_npz assets/stable_diffusion/last_layer_ddim/laplace_results.npz \
+		--uncertainty_keys "$(DAAM_UNCERTAINTY_KEYS)" \
 		--out_dir assets/stable_diffusion/daam_last_layer_ddim
 
 sd-daam-subnet-ddim:
@@ -316,10 +329,101 @@ sd-daam-subnet-ddim:
 		--width $(WIDTH) \
 		--seed $(SEED) \
 		--uncertainty_npz "$(DAAM_UNCERTAINTY_NPZ)" \
+		--uncertainty_keys "$(DAAM_UNCERTAINTY_KEYS)" \
 		--out_dir assets/stable_diffusion/daam_subnet_ddim
+
+sd-daam-bayesdiff-ddim:
+	uv run python $(DAAM_BAYESDIFF_SCRIPT) \
+		--model_id "$(MODEL_ID)" \
+		--prompt "$(PROMPT)" \
+		--words "$(DAAM_WORDS)" \
+		--device $(DEVICE) \
+		--torch_dtype $(TORCH_DTYPE) \
+		--scheduler ddim \
+		--steps $(STEPS_DDIM) \
+		--guidance_scale $(GUIDANCE_SCALE) \
+		--n_z0 $(N_Z0) \
+		--n_lap_pairs $(N_LAP_PAIRS) \
+		--n_samples $(N_SAMPLES) \
+		--height $(HEIGHT) \
+		--width $(WIDTH) \
+		--plot_max_samples $(PLOT_MAX_SAMPLES) \
+		--seed $(SEED) \
+		--laplace_mode last_layer \
+		--daam_python $(DAAM_PYTHON) \
+		--out_dir "$(DAAM_BAYESDIFF_OUT_DIR)/last_layer_ddim"
+
+sd-daam-bayesdiff-ddpm:
+	uv run python $(DAAM_BAYESDIFF_SCRIPT) \
+		--model_id "$(MODEL_ID)" \
+		--prompt "$(PROMPT)" \
+		--words "$(DAAM_WORDS)" \
+		--device $(DEVICE) \
+		--torch_dtype $(TORCH_DTYPE) \
+		--scheduler ddpm \
+		--steps $(STEPS_DDPM) \
+		--guidance_scale $(GUIDANCE_SCALE) \
+		--n_z0 $(N_Z0) \
+		--n_lap_pairs $(N_LAP_PAIRS) \
+		--n_samples $(N_SAMPLES) \
+		--height $(HEIGHT) \
+		--width $(WIDTH) \
+		--plot_max_samples $(PLOT_MAX_SAMPLES) \
+		--seed $(SEED) \
+		--laplace_mode last_layer \
+		--daam_python $(DAAM_PYTHON) \
+		--out_dir "$(DAAM_BAYESDIFF_OUT_DIR)/last_layer_ddpm"
+
+sd-daam-bayesdiff-subnet-ddim:
+	uv run python $(DAAM_BAYESDIFF_SCRIPT) \
+		--model_id "$(MODEL_ID)" \
+		--prompt "$(PROMPT)" \
+		--words "$(DAAM_WORDS)" \
+		--device $(DEVICE) \
+		--torch_dtype $(TORCH_DTYPE) \
+		--scheduler ddim \
+		--steps $(STEPS_DDIM) \
+		--guidance_scale $(GUIDANCE_SCALE) \
+		--n_z0 $(N_Z0) \
+		--n_lap_pairs $(N_LAP_PAIRS) \
+		--n_samples $(N_SAMPLES) \
+		--subnet_n_params $(SUBNET_N_PARAMS) \
+		--subnet_max_tensors $(SUBNET_MAX_TENSORS) \
+		--subnet_mc_samples $(SUBNET_MC_SAMPLES) \
+		--height $(HEIGHT) \
+		--width $(WIDTH) \
+		--plot_max_samples $(PLOT_MAX_SAMPLES) \
+		--seed $(SEED) \
+		--laplace_mode subnet \
+		--daam_python $(DAAM_PYTHON) \
+		--out_dir "$(DAAM_BAYESDIFF_OUT_DIR)/subnet_ddim"
+
+sd-daam-bayesdiff-subnet-ddpm:
+	uv run python $(DAAM_BAYESDIFF_SCRIPT) \
+		--model_id "$(MODEL_ID)" \
+		--prompt "$(PROMPT)" \
+		--words "$(DAAM_WORDS)" \
+		--device $(DEVICE) \
+		--torch_dtype $(TORCH_DTYPE) \
+		--scheduler ddpm \
+		--steps $(STEPS_DDPM) \
+		--guidance_scale $(GUIDANCE_SCALE) \
+		--n_z0 $(N_Z0) \
+		--n_lap_pairs $(N_LAP_PAIRS) \
+		--n_samples $(N_SAMPLES) \
+		--subnet_n_params $(SUBNET_N_PARAMS) \
+		--subnet_max_tensors $(SUBNET_MAX_TENSORS) \
+		--subnet_mc_samples $(SUBNET_MC_SAMPLES) \
+		--height $(HEIGHT) \
+		--width $(WIDTH) \
+		--plot_max_samples $(PLOT_MAX_SAMPLES) \
+		--seed $(SEED) \
+		--laplace_mode subnet \
+		--daam_python $(DAAM_PYTHON) \
+		--out_dir "$(DAAM_BAYESDIFF_OUT_DIR)/subnet_ddpm"
 
 sd-show:
 	uv run python -c "import numpy as np; p='$(OUT_DIR)/laplace_results.npz'; d=np.load(p); order=np.argsort(d['var_mean']); print('file:', p); print('least uncertain:', order[:10], d['var_mean'][order[:10]]); print('most uncertain:', order[-10:][::-1], d['var_mean'][order[-10:][::-1]])"
 
 sd-daam-show:
-	uv run python -c "import numpy as np; p='$(OUT_DIR)/daam_results.npz'; d=np.load(p); order=np.argsort(d['daam_var_mean']); print('file:', p); print('words:', d['daam_words']); print('least uncertain:', order[:10], d['daam_var_mean'][order[:10]]); print('most uncertain:', order[-10:][::-1], d['daam_var_mean'][order[-10:][::-1]])"
+	uv run python -c "import numpy as np; p='$(OUT_DIR)/daam_results.npz'; key='$(DAAM_SCORE_KEY)'; d=np.load(p); order=np.argsort(d[key]); print('file:', p); print('key:', key); print('words:', d['daam_words']); print('least uncertain:', order[:10], d[key][order[:10]]); print('most uncertain:', order[-10:][::-1], d[key][order[-10:][::-1]])"
