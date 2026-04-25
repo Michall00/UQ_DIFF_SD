@@ -1,4 +1,4 @@
-.PHONY: help sd-sync sd-smoke sd-last-ddim sd-last-ddpm sd-subnet-smoke sd-subnet-ddim sd-subnet-ddpm sd-show
+.PHONY: help all sd-sync sd-smoke sd-last-ddim sd-last-ddpm sd-subnet-smoke sd-subnet-ddim sd-subnet-ddpm sd-show
 
 MODEL_ID ?= CompVis/stable-diffusion-v1-4
 TINY_MODEL_ID ?= hf-internal-testing/tiny-stable-diffusion-pipe
@@ -24,6 +24,7 @@ SD_SCRIPT := experiments/stable_diffusion/run_sd_laplace.py
 
 help:
 	@echo "Stable Diffusion UQ targets:"
+	@echo "  make all              run all non-smoke SD experiments"
 	@echo "  make sd-sync          install SD dependencies via uv"
 	@echo "  make sd-smoke         tiny CPU last-layer smoke test"
 	@echo "  make sd-last-ddim     SD v1.4 conv_out LLLA + DDIM"
@@ -37,6 +38,8 @@ help:
 	@echo "  make sd-subnet-ddim PROMPT=\"a red cube on a blue sphere\" N_SAMPLES=16"
 	@echo "  make sd-subnet-ddim SUBNET_N_PARAMS=100000 SUBNET_MC_SAMPLES=4"
 	@echo "  make sd-subnet-ddpm STEPS_DDPM=1000"
+
+all: sd-last-ddim sd-last-ddpm sd-subnet-ddim sd-subnet-ddpm
 
 sd-sync:
 	uv sync --extra stable-diffusion --extra dev
