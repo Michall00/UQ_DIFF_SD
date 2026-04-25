@@ -1,10 +1,14 @@
 """
 experiments/stable_diffusion/run_sd_laplace.py
 -----------------------------------------------
-Last-Layer Laplace + FLARE uncertainty quantification for Stable Diffusion.
+Laplace + FLARE uncertainty quantification for Stable Diffusion.
 
-Fits a diagonal LLLA on UNet's conv_out (~11.5K params), then accumulates
-per-step epistemic variance through DDIM reverse diffusion via FLARE transport:
+Supports two Laplace modes:
+  - last_layer: diagonal LLLA on UNet's conv_out (~11.5K params)
+  - subnet: random network-wide diagonal subnetwork Laplace with MC gamma2
+
+Then accumulates per-step epistemic variance through reverse diffusion via
+FLARE transport:
 
     u_proj = Σ_t (Π_{s>t} a_s)² · b_t² · γ²_t
 
@@ -46,7 +50,7 @@ def get_args():
     p.add_argument("--n_lap_pairs", type=int, default=50,
                    help="Regression pairs for Laplace fitting")
     p.add_argument("--steps", type=int, default=30,
-                   help="DDIM inference steps")
+                   help="Reverse diffusion inference steps")
     p.add_argument("--guidance_scale", type=float, default=7.5)
     p.add_argument(
         "--scheduler",
@@ -54,6 +58,31 @@ def get_args():
         default="ddim",
         choices=["ddim", "ddpm"],
         help="Reverse sampler used for image generation and FLARE transport.",
+    )
+    p.add_argument(
+        "--laplace_mode",
+        type=str,
+        default="last_layer",
+        choices=["last_layer", "subnet"],
+        help="Use conv_out LLLA or a random network-wide UNet subnetwork.",
+    )
+    p.add_argument(
+        "--subnet_n_params",
+        type=int,
+        default=50_000,
+        help="Number of selected scalar parameters for --laplace_mode subnet.",
+    )
+    p.add_argument(
+        "--subnet_max_tensors",
+        type=int,
+        default=12,
+        help="Maximum parameter tensors selected across UNet blocks for subnet Laplace.",
+    )
+    p.add_argument(
+        "--subnet_mc_samples",
+        type=int,
+        default=2,
+        help="Monte Carlo weight perturbations per diffusion step for subnet gamma2.",
     )
     p.add_argument("--height", type=int, default=512)
     p.add_argument("--width", type=int, default=512)
@@ -95,7 +124,8 @@ def gamma2_conv2d(
 
     Returns: (B, C_out, H, W) gamma2 map, clamped >= 0
     """
-    var = posterior_var.to(features.device, features.dtype)
+    features = features.float()
+    var = posterior_var.to(features.device, torch.float32)
 
     C_out, C_in, kH, kW = conv.weight.shape
     patches = F.unfold(features, (kH, kW), padding=conv.padding)
@@ -164,6 +194,209 @@ def ddpm_transport_coeffs(
     return a, b
 
 
+def _subnet_group_name(param_name: str) -> str:
+    parts = param_name.split(".")
+    if len(parts) >= 2 and parts[0] in {"down_blocks", "up_blocks"}:
+        return ".".join(parts[:2])
+    if parts[0] == "mid_block":
+        return "mid_block"
+    return parts[0]
+
+
+class RandomSubnetDiagLaplace:
+    """
+    Diagonal Laplace over a random network-wide UNet subnetwork.
+
+    Fitting uses an empirical diagonal Fisher on selected scalar parameters.
+    Prediction uses Monte Carlo weight perturbations from the diagonal posterior
+    to estimate diag(J Sigma J^T) in latent space. This avoids per-pixel
+    Jacobians for Stable Diffusion while still moving beyond conv_out-only LLLA.
+    """
+
+    def __init__(
+        self,
+        unet: nn.Module,
+        n_params: int,
+        max_tensors: int,
+        seed: int,
+        prior_prec: float = 1.0,
+    ):
+        self.unet = unet
+        self.n_params_target = n_params
+        self.max_tensors = max_tensors
+        self.seed = seed
+        self.prior_prec = prior_prec
+        self.selected = self._select_params()
+        self.n_data = 0
+
+    def _candidate_params(self) -> dict[str, list[tuple[str, nn.Parameter]]]:
+        groups: dict[str, list[tuple[str, nn.Parameter]]] = {}
+        for name, param in self.unet.named_parameters():
+            if not param.requires_grad or not torch.is_floating_point(param):
+                continue
+            if param.ndim < 2:
+                continue
+            if name.startswith("conv_out."):
+                continue
+            if not (
+                name.startswith("conv_in.")
+                or name.startswith("time_embedding.")
+                or name.startswith("down_blocks.")
+                or name.startswith("mid_block.")
+                or name.startswith("up_blocks.")
+            ):
+                continue
+            groups.setdefault(_subnet_group_name(name), []).append((name, param))
+        return groups
+
+    def _select_params(self) -> list[dict[str, object]]:
+        rng = np.random.default_rng(self.seed)
+        groups = self._candidate_params()
+        group_names = list(groups)
+        rng.shuffle(group_names)
+        for group in group_names:
+            rng.shuffle(groups[group])
+
+        chosen: list[tuple[str, nn.Parameter]] = []
+        while len(chosen) < self.max_tensors and any(groups.values()):
+            for group in group_names:
+                if groups[group]:
+                    chosen.append(groups[group].pop())
+                    if len(chosen) >= self.max_tensors:
+                        break
+
+        if not chosen:
+            raise RuntimeError("No eligible UNet tensors found for subnet Laplace.")
+
+        per_tensor = int(np.ceil(self.n_params_target / len(chosen)))
+        selected: list[dict[str, object]] = []
+        remaining = self.n_params_target
+
+        for name, param in chosen:
+            if remaining <= 0:
+                break
+            n_select = min(param.numel(), per_tensor, remaining)
+            if n_select <= 0:
+                continue
+            idx_np = rng.choice(param.numel(), size=n_select, replace=False)
+            idx_np.sort()
+            selected.append(
+                {
+                    "name": name,
+                    "param": param,
+                    "idx": torch.from_numpy(idx_np).long(),
+                    "H": torch.zeros(n_select, dtype=torch.float32),
+                    "posterior_var": torch.empty(n_select, dtype=torch.float32),
+                }
+            )
+            remaining -= n_select
+
+        if not selected:
+            raise RuntimeError("Empty random subnetwork after parameter selection.")
+        return selected
+
+    @property
+    def n_params(self) -> int:
+        return sum(int(item["idx"].numel()) for item in self.selected)
+
+    def describe(self):
+        print(f"Random subnet tensors: {len(self.selected)}")
+        print(f"  Selected scalar params: {self.n_params:,}")
+        for item in self.selected:
+            print(f"    {item['name']}: {item['idx'].numel():,}")
+
+    def _set_fit_requires_grad(self) -> list[bool]:
+        original = [p.requires_grad for p in self.unet.parameters()]
+        for p in self.unet.parameters():
+            p.requires_grad_(False)
+        for item in self.selected:
+            param = item["param"]
+            param.requires_grad_(True)
+        return original
+
+    def _restore_requires_grad(self, original: list[bool]):
+        for param, requires_grad in zip(self.unet.parameters(), original):
+            param.requires_grad_(requires_grad)
+
+    def fit_from_unet(self, unet, z0_set, abar, text_emb, T, n_pairs, device):
+        n_z0 = z0_set.shape[0]
+        latent_dtype = next(unet.parameters()).dtype
+        original_requires_grad = self._set_fit_requires_grad()
+        unet.train(False)
+
+        try:
+            for _ in tqdm(range(n_pairs), desc="  Subnet Fisher"):
+                unet.zero_grad(set_to_none=True)
+
+                idx = torch.randint(0, n_z0, (1,)).item()
+                z0 = z0_set[idx:idx + 1]
+                t = torch.randint(0, T, (1,), device=device)
+                abar_t = abar[t].view(1, 1, 1, 1)
+                eps = torch.randn_like(z0)
+                z_t = (
+                    torch.sqrt(abar_t) * z0.float()
+                    + torch.sqrt(1 - abar_t) * eps.float()
+                ).to(dtype=latent_dtype)
+
+                emb = text_emb.expand(1, -1, -1)
+                pred = unet(z_t, t, encoder_hidden_states=emb).sample
+                loss = 0.5 * (pred.float() - eps.float()).pow(2).mean()
+                loss.backward()
+
+                for item in self.selected:
+                    param = item["param"]
+                    grad = param.grad
+                    if grad is None:
+                        continue
+                    sel_idx = item["idx"].to(grad.device)
+                    h = grad.detach().flatten()[sel_idx].float().pow(2)
+                    item["H"] = item["H"].to(h.device) + h
+
+                self.n_data += 1
+        finally:
+            self._restore_requires_grad(original_requires_grad)
+            unet.zero_grad(set_to_none=True)
+
+        if self.n_data > 0:
+            for item in self.selected:
+                item["H"] = item["H"] / self.n_data
+
+    def optimize_prior(self):
+        theta2_sum = torch.tensor(0.0)
+        for item in self.selected:
+            param = item["param"]
+            sel_idx = item["idx"].to(param.device)
+            theta = param.detach().flatten()[sel_idx].float()
+            theta2_sum = theta2_sum.to(theta.device) + theta.pow(2).sum()
+        self.prior_prec = float(self.n_params / (theta2_sum + 1e-8))
+        self._update_posterior_variance()
+
+    def _update_posterior_variance(self):
+        for item in self.selected:
+            prec = item["H"].float() + self.prior_prec
+            item["posterior_var"] = 1.0 / prec.clamp_min(1e-12)
+
+    def perturb_(self, generator: torch.Generator) -> list[tuple[nn.Parameter, torch.Tensor, torch.Tensor]]:
+        perturbations = []
+        for item in self.selected:
+            param = item["param"]
+            device = param.device
+            flat = param.data.view(-1)
+            sel_idx = item["idx"].to(device)
+            var = item["posterior_var"].to(device=device, dtype=torch.float32)
+            noise = torch.randn(
+                var.shape, device=device, dtype=torch.float32, generator=generator
+            ) * var.sqrt()
+            noise_param = noise.to(dtype=param.dtype)
+            flat[sel_idx] += noise_param
+            perturbations.append((param, sel_idx, noise_param))
+        return perturbations
+
+    def restore_(self, perturbations: list[tuple[nn.Parameter, torch.Tensor, torch.Tensor]]):
+        for param, sel_idx, noise in reversed(perturbations):
+            param.data.view(-1)[sel_idx] -= noise
+
+
 class ManualDiagLaplace:
     """
     Diagonal GGN-Laplace for a single Conv2d layer.
@@ -191,6 +424,7 @@ class ManualDiagLaplace:
         residuals : (B, C_out, H, W) — (prediction - target) at conv_out output
         """
         conv = self.conv
+        features = features.float()
         C_out, C_in, kH, kW = conv.weight.shape
 
         patches = F.unfold(features, (kH, kW), padding=conv.padding)
@@ -219,7 +453,10 @@ class ManualDiagLaplace:
             t = torch.randint(0, T, (1,), device=device)
             abar_t = abar[t].view(1, 1, 1, 1)
             eps = torch.randn_like(z0)
-            z_t = torch.sqrt(abar_t) * z0 + torch.sqrt(1 - abar_t) * eps
+            z_t = (
+                torch.sqrt(abar_t) * z0.float()
+                + torch.sqrt(1 - abar_t) * eps.float()
+            ).to(dtype=z0.dtype)
 
             emb = text_emb.expand(1, -1, -1)
             pred = unet(z_t, t, encoder_hidden_states=emb).sample
@@ -258,10 +495,13 @@ class FeatureCapture:
 def generate_z0(unet, scheduler, text_emb, uncond_emb, latent_shape,
                 n_z0, steps, guidance_scale, device, base_seed):
     z0_list = []
+    latent_dtype = next(unet.parameters()).dtype
     for i in range(n_z0):
         scheduler.set_timesteps(steps)
         gen = torch.Generator(device=device).manual_seed(base_seed + i)
-        z = torch.randn(1, *latent_shape, device=device, generator=gen)
+        z = torch.randn(
+            1, *latent_shape, device=device, dtype=latent_dtype, generator=gen
+        )
 
         for t in tqdm(scheduler.timesteps, desc=f"  z0 [{i+1}/{n_z0}]", leave=False):
             z_in = torch.cat([z, z])
@@ -269,17 +509,50 @@ def generate_z0(unet, scheduler, text_emb, uncond_emb, latent_shape,
             pred = unet(z_in, t, encoder_hidden_states=emb).sample
             eu, ec = pred.chunk(2)
             eps = eu + guidance_scale * (ec - eu)
-            z = scheduler.step(eps, t, z).prev_sample
+            z = scheduler.step(eps, t, z, generator=gen).prev_sample.to(dtype=latent_dtype)
 
         z0_list.append(z)
     return torch.cat(z0_list)
 
 
 @torch.no_grad()
+def gamma2_subnet_mc(
+    unet,
+    laplace: RandomSubnetDiagLaplace,
+    z: torch.Tensor,
+    t: torch.Tensor,
+    text_emb: torch.Tensor,
+    uncond_emb: torch.Tensor,
+    guidance_scale: float,
+    base_eps: torch.Tensor,
+    n_mc: int,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    if n_mc <= 0:
+        raise ValueError("--subnet_mc_samples must be > 0 for subnet Laplace.")
+
+    z_in = torch.cat([z, z])
+    emb = torch.cat([uncond_emb, text_emb])
+    gamma2 = torch.zeros_like(base_eps, dtype=torch.float32)
+
+    for _ in range(n_mc):
+        perturbations = laplace.perturb_(generator)
+        try:
+            pred = unet(z_in, t, encoder_hidden_states=emb).sample
+            eu, ec = pred.chunk(2)
+            eps = eu + guidance_scale * (ec - eu)
+            gamma2 = gamma2 + (eps.float() - base_eps.float()).pow(2)
+        finally:
+            laplace.restore_(perturbations)
+
+    return (gamma2 / n_mc).clamp_min(0)
+
+
+@torch.no_grad()
 def sample_with_flare(
-    unet, laplace: ManualDiagLaplace, scheduler, text_emb, uncond_emb, abar,
+    unet, laplace, scheduler, text_emb, uncond_emb, abar,
     latent_shape, steps, guidance_scale, device, seed,
-    feat_cap, scheduler_name,
+    feat_cap, scheduler_name, laplace_mode, subnet_mc_samples,
 ):
     """DDIM sampling with FLARE epistemic uncertainty transport.
 
@@ -294,10 +567,14 @@ def sample_with_flare(
     """
     scheduler.set_timesteps(steps)
     gen = torch.Generator(device=device).manual_seed(seed)
-    z = torch.randn(1, *latent_shape, device=device, generator=gen)
+    laplace_gen = torch.Generator(device=device).manual_seed(seed + 10_000)
+    latent_dtype = next(unet.parameters()).dtype
+    z = torch.randn(
+        1, *latent_shape, device=device, dtype=latent_dtype, generator=gen
+    )
 
-    Var_proj = torch.zeros_like(z)
-    cum_a2 = torch.ones(1, 1, 1, 1, device=device)
+    Var_proj = torch.zeros_like(z, dtype=torch.float32)
+    cum_a2 = torch.ones(1, 1, 1, 1, device=device, dtype=torch.float32)
 
     timesteps = list(scheduler.timesteps)
 
@@ -310,8 +587,16 @@ def sample_with_flare(
         eu, ec = pred.chunk(2)
         eps = eu + guidance_scale * (ec - eu)
 
-        cond_feats = feat_cap.features[1:2]
-        gamma2_t = gamma2_conv2d(cond_feats, laplace.posterior_variance, unet.conv_out)
+        if laplace_mode == "last_layer":
+            cond_feats = feat_cap.features[1:2]
+            gamma2_t = gamma2_conv2d(cond_feats, laplace.posterior_variance, unet.conv_out)
+        elif laplace_mode == "subnet":
+            gamma2_t = gamma2_subnet_mc(
+                unet, laplace, z, t, text_emb, uncond_emb,
+                guidance_scale, eps, subnet_mc_samples, laplace_gen,
+            )
+        else:
+            raise ValueError(f"Unsupported Laplace mode: {laplace_mode}")
 
         if scheduler_name == "ddim":
             a, b = ddim_transport_coeffs(abar, timesteps, i, device)
@@ -323,7 +608,7 @@ def sample_with_flare(
         Var_proj = Var_proj + cum_a2 * (b ** 2) * gamma2_t
         cum_a2 = cum_a2 * (a ** 2)
 
-        z = scheduler.step(eps, t, z, generator=gen).prev_sample
+        z = scheduler.step(eps, t, z, generator=gen).prev_sample.to(dtype=latent_dtype)
 
     return z, Var_proj
 
@@ -404,6 +689,11 @@ def main():
 
     unet = pipe.unet
     vae = pipe.vae
+    unet.eval()
+    vae.eval()
+    pipe.text_encoder.eval()
+    vae.requires_grad_(False)
+    pipe.text_encoder.requires_grad_(False)
     scheduler_cls = DDIMScheduler if args.scheduler == "ddim" else DDPMScheduler
     scheduler = scheduler_cls.from_pretrained(args.model_id, subfolder="scheduler")
 
@@ -412,13 +702,15 @@ def main():
         args.prompt, padding="max_length",
         max_length=tok.model_max_length, truncation=True, return_tensors="pt",
     )
-    text_emb = pipe.text_encoder(text_input.input_ids.to(device))[0]
+    with torch.no_grad():
+        text_emb = pipe.text_encoder(text_input.input_ids.to(device))[0].detach()
 
     uncond_input = tok(
         "", padding="max_length",
         max_length=tok.model_max_length, truncation=True, return_tensors="pt",
     )
-    uncond_emb = pipe.text_encoder(uncond_input.input_ids.to(device))[0]
+    with torch.no_grad():
+        uncond_emb = pipe.text_encoder(uncond_input.input_ids.to(device))[0].detach()
 
     latent_shape = (unet.config.in_channels, args.height // 8, args.width // 8)
     feat_cap = FeatureCapture(unet.conv_out)
@@ -428,7 +720,10 @@ def main():
     print(f"UNet conv_out: {unet.conv_out}")
     print(f"  Trainable params for LLLA: {n_conv}")
 
-    print(f"Generating {args.n_z0} reference latents via DDIM ({args.steps} steps)...")
+    print(
+        f"Generating {args.n_z0} reference latents via "
+        f"{args.scheduler.upper()} ({args.steps} steps)..."
+    )
     t0 = time.time()
     z0_set = generate_z0(
         unet, scheduler, text_emb, uncond_emb, latent_shape,
@@ -436,13 +731,33 @@ def main():
     )
     print(f"  Done in {time.time()-t0:.0f}s. z0_set shape: {z0_set.shape}")
 
-    print(f"Fitting manual diagonal Laplace on conv_out ({n_conv} params)...")
+    if args.laplace_mode == "last_layer":
+        print(f"Fitting manual diagonal Laplace on conv_out ({n_conv} params)...")
+    else:
+        print(
+            "Fitting random subnet diagonal Laplace "
+            f"({args.subnet_n_params:,} target params, "
+            f"{args.subnet_max_tensors} tensors max)..."
+        )
     t0 = time.time()
-    laplace = ManualDiagLaplace(unet.conv_out)
-    laplace.fit_from_unet(
-        unet, feat_cap, z0_set, abar, text_emb,
-        T=1000, n_pairs=args.n_lap_pairs, device=device,
-    )
+    if args.laplace_mode == "last_layer":
+        laplace = ManualDiagLaplace(unet.conv_out)
+        laplace.fit_from_unet(
+            unet, feat_cap, z0_set, abar, text_emb,
+            T=1000, n_pairs=args.n_lap_pairs, device=device,
+        )
+    else:
+        laplace = RandomSubnetDiagLaplace(
+            unet,
+            n_params=args.subnet_n_params,
+            max_tensors=args.subnet_max_tensors,
+            seed=args.seed,
+        )
+        laplace.describe()
+        laplace.fit_from_unet(
+            unet, z0_set, abar, text_emb,
+            T=1000, n_pairs=args.n_lap_pairs, device=device,
+        )
     laplace.optimize_prior()
     print(f"  Hessian + prior done in {time.time()-t0:.0f}s")
     print(f"  prior_prec = {laplace.prior_prec:.2e}")
@@ -460,6 +775,7 @@ def main():
             unet, laplace, scheduler, text_emb, uncond_emb, abar,
             latent_shape, args.steps, args.guidance_scale,
             device, seed, feat_cap, args.scheduler,
+            args.laplace_mode, args.subnet_mc_samples,
         )
         print(f"  Done in {time.time()-t0:.0f}s")
 
