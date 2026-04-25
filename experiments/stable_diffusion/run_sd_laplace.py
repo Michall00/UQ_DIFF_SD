@@ -29,13 +29,19 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from dataclasses import dataclass
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-from diffusers import StableDiffusionPipeline, DDIMScheduler, DDPMScheduler
+from diffusers import (
+    StableDiffusionPipeline,
+    StableDiffusionXLPipeline,
+    DDIMScheduler,
+    DDPMScheduler,
+)
 from diffusers.models.attention_processor import AttnProcessor2_0
 from tqdm import tqdm
 
@@ -44,6 +50,13 @@ def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--prompt", type=str, default="a photo of a cat sitting on a chair")
     p.add_argument("--model_id", type=str, default="CompVis/stable-diffusion-v1-4")
+    p.add_argument(
+        "--pipeline",
+        type=str,
+        default="auto",
+        choices=["auto", "sd", "sdxl"],
+        help="Pipeline family. auto uses SDXL for model ids containing sdxl or xl.",
+    )
     p.add_argument("--n_samples", type=int, default=2,
                    help="Images to generate with uncertainty")
     p.add_argument("--n_z0", type=int, default=2,
@@ -105,6 +118,12 @@ def get_args():
     )
     p.add_argument("--height", type=int, default=512)
     p.add_argument("--width", type=int, default=512)
+    p.add_argument(
+        "--plot_max_samples",
+        type=int,
+        default=16,
+        help="Maximum samples to include in sd_laplace_flare.png. Use 0 to skip plotting.",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="mps")
     p.add_argument(
@@ -132,6 +151,35 @@ def parse_token_indices(raw: str) -> list[int]:
     if not raw.strip():
         return []
     return [int(part.strip()) for part in raw.split(",") if part.strip()]
+
+
+@dataclass
+class DiffusionConditioning:
+    text_emb: torch.Tensor
+    uncond_emb: torch.Tensor
+    cond_kwargs: dict[str, torch.Tensor] | None = None
+    uncond_kwargs: dict[str, torch.Tensor] | None = None
+
+    def cond_forward_kwargs(self) -> dict[str, dict[str, torch.Tensor]]:
+        if not self.cond_kwargs:
+            return {}
+        return {"added_cond_kwargs": self.cond_kwargs}
+
+    def cfg_forward_kwargs(self) -> dict[str, dict[str, torch.Tensor]]:
+        if not self.cond_kwargs:
+            return {}
+        if not self.uncond_kwargs:
+            raise ValueError("CFG conditioning requires unconditional added kwargs.")
+        return {
+            "added_cond_kwargs": {
+                key: torch.cat([self.uncond_kwargs[key], value], dim=0)
+                for key, value in self.cond_kwargs.items()
+            }
+        }
+
+
+def cfg_embeddings(cond: DiffusionConditioning) -> torch.Tensor:
+    return torch.cat([cond.uncond_emb, cond.text_emb])
 
 
 def build_attention_token_weights(tokenizer, text_input, token_indices: list[int]):
@@ -556,7 +604,7 @@ class RandomSubnetDiagLaplace:
         for param, requires_grad in zip(self.unet.parameters(), original):
             param.requires_grad_(requires_grad)
 
-    def fit_from_unet(self, unet, z0_set, abar, text_emb, T, n_pairs, device):
+    def fit_from_unet(self, unet, z0_set, abar, cond, T, n_pairs, device):
         n_z0 = z0_set.shape[0]
         latent_dtype = next(unet.parameters()).dtype
         original_requires_grad = self._set_fit_requires_grad()
@@ -576,8 +624,12 @@ class RandomSubnetDiagLaplace:
                     + torch.sqrt(1 - abar_t) * eps.float()
                 ).to(dtype=latent_dtype)
 
-                emb = text_emb.expand(1, -1, -1)
-                pred = unet(z_t, t, encoder_hidden_states=emb).sample
+                pred = unet(
+                    z_t,
+                    t,
+                    encoder_hidden_states=cond.text_emb,
+                    **cond.cond_forward_kwargs(),
+                ).sample
                 loss = 0.5 * (pred.float() - eps.float()).pow(2).mean()
                 loss.backward()
 
@@ -680,7 +732,7 @@ class ManualDiagLaplace:
         self.H_diag = self.H_diag.to(H_diag.device) + H_diag
         self.n_data += B * L
 
-    def fit_from_unet(self, unet, feat_cap, z0_set, abar, text_emb, T, n_pairs, device):
+    def fit_from_unet(self, unet, feat_cap, z0_set, abar, cond, T, n_pairs, device):
         """
         Build diagonal Hessian by running forward diffusion + UNet forward.
         """
@@ -696,8 +748,12 @@ class ManualDiagLaplace:
                 + torch.sqrt(1 - abar_t) * eps.float()
             ).to(dtype=z0.dtype)
 
-            emb = text_emb.expand(1, -1, -1)
-            pred = unet(z_t, t, encoder_hidden_states=emb).sample
+            pred = unet(
+                z_t,
+                t,
+                encoder_hidden_states=cond.text_emb,
+                **cond.cond_forward_kwargs(),
+            ).sample
 
             feats = feat_cap.features
             residual = pred - eps
@@ -730,7 +786,7 @@ class FeatureCapture:
 
 
 @torch.no_grad()
-def generate_z0(unet, scheduler, text_emb, uncond_emb, latent_shape,
+def generate_z0(unet, scheduler, cond, latent_shape,
                 n_z0, steps, guidance_scale, device, base_seed):
     z0_list = []
     latent_dtype = next(unet.parameters()).dtype
@@ -743,8 +799,12 @@ def generate_z0(unet, scheduler, text_emb, uncond_emb, latent_shape,
 
         for t in tqdm(scheduler.timesteps, desc=f"  z0 [{i+1}/{n_z0}]", leave=False):
             z_in = torch.cat([z, z])
-            emb = torch.cat([uncond_emb, text_emb])
-            pred = unet(z_in, t, encoder_hidden_states=emb).sample
+            pred = unet(
+                z_in,
+                t,
+                encoder_hidden_states=cfg_embeddings(cond),
+                **cond.cfg_forward_kwargs(),
+            ).sample
             eu, ec = pred.chunk(2)
             eps = eu + guidance_scale * (ec - eu)
             z = scheduler.step(eps, t, z, generator=gen).prev_sample.to(dtype=latent_dtype)
@@ -759,8 +819,7 @@ def gamma2_subnet_mc(
     laplace: RandomSubnetDiagLaplace,
     z: torch.Tensor,
     t: torch.Tensor,
-    text_emb: torch.Tensor,
-    uncond_emb: torch.Tensor,
+    cond: DiffusionConditioning,
     guidance_scale: float,
     base_eps: torch.Tensor,
     n_mc: int,
@@ -770,13 +829,17 @@ def gamma2_subnet_mc(
         raise ValueError("--subnet_mc_samples must be > 0 for subnet Laplace.")
 
     z_in = torch.cat([z, z])
-    emb = torch.cat([uncond_emb, text_emb])
     gamma2 = torch.zeros_like(base_eps, dtype=torch.float32)
 
     for _ in range(n_mc):
         perturbations = laplace.perturb_(generator)
         try:
-            pred = unet(z_in, t, encoder_hidden_states=emb).sample
+            pred = unet(
+                z_in,
+                t,
+                encoder_hidden_states=cfg_embeddings(cond),
+                **cond.cfg_forward_kwargs(),
+            ).sample
             eu, ec = pred.chunk(2)
             eps = eu + guidance_scale * (ec - eu)
             gamma2 = gamma2 + (eps.float() - base_eps.float()).pow(2)
@@ -788,7 +851,7 @@ def gamma2_subnet_mc(
 
 @torch.no_grad()
 def sample_with_flare(
-    unet, laplace, scheduler, text_emb, uncond_emb, abar,
+    unet, laplace, scheduler, cond, abar,
     latent_shape, steps, guidance_scale, device, seed,
     feat_cap, scheduler_name, laplace_mode, subnet_mc_samples,
     attention_store=None, attention_token_weights=None,
@@ -823,10 +886,14 @@ def sample_with_flare(
         t_int = t.item()
 
         z_in = torch.cat([z, z])
-        emb = torch.cat([uncond_emb, text_emb])
         if attention_store is not None and attention_token_weights is not None:
             attention_store.start_step(latent_shape[1:], attention_token_weights)
-        pred = unet(z_in, t, encoder_hidden_states=emb).sample
+        pred = unet(
+            z_in,
+            t,
+            encoder_hidden_states=cfg_embeddings(cond),
+            **cond.cfg_forward_kwargs(),
+        ).sample
         if attention_store is not None:
             attention_store.finish_step()
         eu, ec = pred.chunk(2)
@@ -837,7 +904,7 @@ def sample_with_flare(
             gamma2_t = gamma2_conv2d(cond_feats, laplace.posterior_variance, unet.conv_out)
         elif laplace_mode == "subnet":
             gamma2_t = gamma2_subnet_mc(
-                unet, laplace, z, t, text_emb, uncond_emb,
+                unet, laplace, z, t, cond,
                 guidance_scale, eps, subnet_mc_samples, laplace_gen,
             )
         else:
@@ -868,8 +935,84 @@ def decode_latent(vae, z, device):
     return img.detach().float().cpu().permute(0, 2, 3, 1).numpy()[0]
 
 
-def plot_results(images, var_maps, prompt, out_dir):
-    n = len(images)
+def infer_pipeline_family(model_id: str, requested: str) -> str:
+    if requested != "auto":
+        return requested
+    lower = model_id.lower()
+    if "sdxl" in lower or "xl" in lower:
+        return "sdxl"
+    return "sd"
+
+
+def load_pipeline(model_id: str, family: str, torch_dtype: torch.dtype):
+    pipeline_cls = StableDiffusionXLPipeline if family == "sdxl" else StableDiffusionPipeline
+    return pipeline_cls.from_pretrained(model_id, torch_dtype=torch_dtype)
+
+
+def encode_conditioning(pipe, family: str, prompt: str, height: int, width: int, device: str):
+    if family == "sdxl":
+        with torch.no_grad():
+            (
+                prompt_embeds,
+                negative_prompt_embeds,
+                pooled_prompt_embeds,
+                negative_pooled_prompt_embeds,
+            ) = pipe.encode_prompt(
+                prompt=prompt,
+                device=device,
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=True,
+                negative_prompt="",
+            )
+        original_size = (height, width)
+        target_size = (height, width)
+        crops_coords_top_left = (0, 0)
+        projection_dim = pipe.text_encoder_2.config.projection_dim
+        add_time_ids = pipe._get_add_time_ids(
+            original_size,
+            crops_coords_top_left,
+            target_size,
+            dtype=prompt_embeds.dtype,
+            text_encoder_projection_dim=projection_dim,
+        ).to(device)
+        return DiffusionConditioning(
+            text_emb=prompt_embeds.detach(),
+            uncond_emb=negative_prompt_embeds.detach(),
+            cond_kwargs={
+                "text_embeds": pooled_prompt_embeds.detach(),
+                "time_ids": add_time_ids,
+            },
+            uncond_kwargs={
+                "text_embeds": negative_pooled_prompt_embeds.detach(),
+                "time_ids": add_time_ids,
+            },
+        ), None, None
+
+    tok = pipe.tokenizer
+    text_input = tok(
+        prompt, padding="max_length",
+        max_length=tok.model_max_length, truncation=True,
+        return_attention_mask=True, return_tensors="pt",
+    )
+    with torch.no_grad():
+        text_emb = pipe.text_encoder(text_input.input_ids.to(device))[0].detach()
+
+    uncond_input = tok(
+        "", padding="max_length",
+        max_length=tok.model_max_length, truncation=True,
+        return_attention_mask=True, return_tensors="pt",
+    )
+    with torch.no_grad():
+        uncond_emb = pipe.text_encoder(uncond_input.input_ids.to(device))[0].detach()
+
+    return DiffusionConditioning(text_emb=text_emb, uncond_emb=uncond_emb), tok, text_input
+
+
+def plot_results(images, var_maps, prompt, out_dir, max_samples=16):
+    if max_samples <= 0:
+        print("Skipping plot (--plot_max_samples <= 0).")
+        return
+    n = min(len(images), max_samples)
     fig, axes = plt.subplots(3, n, figsize=(5 * n, 14))
     if n == 1:
         axes = axes[:, None]
@@ -929,11 +1072,10 @@ def main():
     device = args.device
     torch.manual_seed(args.seed)
 
-    print(f"Loading {args.model_id}...")
+    pipeline_family = infer_pipeline_family(args.model_id, args.pipeline)
+    print(f"Loading {args.model_id} ({pipeline_family})...")
     torch_dtype = resolve_torch_dtype(args.torch_dtype, device)
-    pipe = StableDiffusionPipeline.from_pretrained(
-        args.model_id, torch_dtype=torch_dtype,
-    )
+    pipe = load_pipeline(args.model_id, pipeline_family, torch_dtype)
     pipe = pipe.to(device)
     if hasattr(pipe, "enable_attention_slicing"):
         pipe.enable_attention_slicing()
@@ -942,28 +1084,24 @@ def main():
     vae = pipe.vae
     unet.eval()
     vae.eval()
-    pipe.text_encoder.eval()
     vae.requires_grad_(False)
-    pipe.text_encoder.requires_grad_(False)
+    if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
+        pipe.text_encoder.eval()
+        pipe.text_encoder.requires_grad_(False)
+    if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
+        pipe.text_encoder_2.eval()
+        pipe.text_encoder_2.requires_grad_(False)
     scheduler_cls = DDIMScheduler if args.scheduler == "ddim" else DDPMScheduler
     scheduler = scheduler_cls.from_pretrained(args.model_id, subfolder="scheduler")
 
-    tok = pipe.tokenizer
-    text_input = tok(
-        args.prompt, padding="max_length",
-        max_length=tok.model_max_length, truncation=True,
-        return_attention_mask=True, return_tensors="pt",
+    cond, tok, text_input = encode_conditioning(
+        pipe, pipeline_family, args.prompt, args.height, args.width, device
     )
-    with torch.no_grad():
-        text_emb = pipe.text_encoder(text_input.input_ids.to(device))[0].detach()
-
-    uncond_input = tok(
-        "", padding="max_length",
-        max_length=tok.model_max_length, truncation=True,
-        return_attention_mask=True, return_tensors="pt",
-    )
-    with torch.no_grad():
-        uncond_emb = pipe.text_encoder(uncond_input.input_ids.to(device))[0].detach()
+    if pipeline_family == "sdxl" and args.attention_aggregation != "none":
+        raise ValueError(
+            "--attention_aggregation is currently supported only for SD 1.x/2.x. "
+            "Run SDXL with --attention_aggregation none."
+        )
 
     latent_shape = (unet.config.in_channels, args.height // 8, args.width // 8)
     feat_cap = FeatureCapture(unet.conv_out)
@@ -979,7 +1117,7 @@ def main():
     )
     t0 = time.time()
     z0_set = generate_z0(
-        unet, scheduler, text_emb, uncond_emb, latent_shape,
+        unet, scheduler, cond, latent_shape,
         args.n_z0, args.steps, args.guidance_scale, device, args.seed,
     )
     print(f"  Done in {time.time()-t0:.0f}s. z0_set shape: {z0_set.shape}")
@@ -996,7 +1134,7 @@ def main():
     if args.laplace_mode == "last_layer":
         laplace = ManualDiagLaplace(unet.conv_out)
         laplace.fit_from_unet(
-            unet, feat_cap, z0_set, abar, text_emb,
+            unet, feat_cap, z0_set, abar, cond,
             T=1000, n_pairs=args.n_lap_pairs, device=device,
         )
     else:
@@ -1008,7 +1146,7 @@ def main():
         )
         laplace.describe()
         laplace.fit_from_unet(
-            unet, z0_set, abar, text_emb,
+            unet, z0_set, abar, cond,
             T=1000, n_pairs=args.n_lap_pairs, device=device,
         )
     laplace.optimize_prior()
@@ -1042,7 +1180,7 @@ def main():
         print(f"Sampling image {i+1}/{args.n_samples} (seed={seed})...")
         t0 = time.time()
         z0, var_proj, attention_map = sample_with_flare(
-            unet, laplace, scheduler, text_emb, uncond_emb, abar,
+            unet, laplace, scheduler, cond, abar,
             latent_shape, args.steps, args.guidance_scale,
             device, seed, feat_cap, args.scheduler,
             args.laplace_mode, args.subnet_mc_samples,
@@ -1088,7 +1226,7 @@ def main():
     )
     print(f"Saved results to {args.out_dir}/laplace_results.npz")
 
-    plot_results(images, var_maps, args.prompt, args.out_dir)
+    plot_results(images, var_maps, args.prompt, args.out_dir, args.plot_max_samples)
     feat_cap.remove()
     print("Done!")
 

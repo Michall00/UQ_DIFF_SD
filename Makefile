@@ -1,6 +1,7 @@
-.PHONY: help all sd-sync sd-smoke sd-last-ddim sd-last-ddpm sd-subnet-smoke sd-subnet-ddim sd-subnet-ddpm sd-eval-ddim sd-benchmark-ddim sd-daam-ddim sd-daam-subnet-ddim sd-daam-show sd-show
+.PHONY: help all sd-sync sd-smoke sd-last-ddim sd-last-ddpm sd-subnet-smoke sd-subnet-ddim sd-subnet-ddpm sd-eval-ddim sd-benchmark-ddim sdxl-last-ddim sdxl-subnet-ddim sdxl-eval-ddim sdxl-benchmark-ddim sd-daam-ddim sd-daam-subnet-ddim sd-daam-show sd-show
 
 MODEL_ID ?= CompVis/stable-diffusion-v1-4
+SDXL_MODEL_ID ?= stabilityai/stable-diffusion-xl-base-1.0
 TINY_MODEL_ID ?= hf-internal-testing/tiny-stable-diffusion-pipe
 PROMPT ?= a human hand with five fingers
 DEVICE ?= cuda
@@ -12,9 +13,12 @@ STEPS_DDIM ?= 30
 STEPS_DDPM ?= 100
 HEIGHT ?= 512
 WIDTH ?= 512
+SDXL_HEIGHT ?= 1024
+SDXL_WIDTH ?= 1024
 N_Z0 ?= 4
 N_LAP_PAIRS ?= 100
 N_SAMPLES ?= 8
+PLOT_MAX_SAMPLES ?= 16
 
 SUBNET_N_PARAMS ?= 50000
 SUBNET_MAX_TENSORS ?= 12
@@ -28,6 +32,8 @@ DAAM_UNCERTAINTY_NPZ ?= assets/stable_diffusion/subnet_ddim/laplace_results.npz
 DAAM_WITH := --python $(DAAM_PYTHON) --with daam==0.2.0 --with huggingface-hub==0.17.3
 EVAL_NPZS ?= assets/stable_diffusion/last_layer_ddim/laplace_results.npz assets/stable_diffusion/subnet_ddim/laplace_results.npz
 EVAL_OUT_DIR ?= assets/stable_diffusion/eval_ddim
+SDXL_EVAL_NPZS ?= assets/stable_diffusion/sdxl_last_layer_ddim/laplace_results.npz assets/stable_diffusion/sdxl_subnet_ddim/laplace_results.npz
+SDXL_EVAL_OUT_DIR ?= assets/stable_diffusion/eval_sdxl_ddim
 EVAL_CLIP_MODEL ?= openai/clip-vit-base-patch32
 EVAL_BATCH_SIZE ?= 16
 EVAL_FILTER_FRACS ?= 0.1,0.2,0.3
@@ -48,6 +54,9 @@ help:
 	@echo "  make sd-subnet-ddpm   SD v1.4 random subnet FLARE + DDPM"
 	@echo "  make sd-eval-ddim     evaluate last_layer_ddim and subnet_ddim with CLIPScore"
 	@echo "  make sd-benchmark-ddim  run last/subnet DDIM, then evaluate"
+	@echo "  make sdxl-last-ddim   SDXL base conv_out LLLA + DDIM"
+	@echo "  make sdxl-subnet-ddim SDXL base random subnet FLARE + DDIM"
+	@echo "  make sdxl-benchmark-ddim  run SDXL last/subnet DDIM, then evaluate"
 	@echo "  make sd-daam-ddim     DAAM maps + weighted scores for last_layer_ddim"
 	@echo "  make sd-daam-subnet-ddim  DAAM maps + weighted scores for subnet_ddim"
 	@echo "  make sd-daam-show OUT_DIR=...  print DAAM-weighted ranking"
@@ -59,11 +68,14 @@ help:
 	@echo "  make sd-subnet-ddpm STEPS_DDPM=1000"
 	@echo "  make sd-subnet-ddim ATTENTION_AGGREGATION=cross SAVE_ATTENTION_MAPS=--save_attention_maps"
 	@echo "  make sd-benchmark-ddim N_SAMPLES=100"
+	@echo "  make sdxl-benchmark-ddim PROMPT=\"a soccer match in a packed stadium\" N_SAMPLES=50"
 	@echo "  make sd-daam-subnet-ddim DAAM_WORDS=hand,fingers"
 
 all: sd-last-ddim sd-last-ddpm sd-subnet-ddim sd-subnet-ddpm
 
 sd-benchmark-ddim: sd-last-ddim sd-subnet-ddim sd-eval-ddim
+
+sdxl-benchmark-ddim: sdxl-last-ddim sdxl-subnet-ddim sdxl-eval-ddim
 
 sd-sync:
 	uv sync --extra stable-diffusion --extra dev
@@ -84,6 +96,7 @@ sd-smoke:
 		--n_samples 1 \
 		--height 64 \
 		--width 64 \
+		--plot_max_samples $(PLOT_MAX_SAMPLES) \
 		--seed $(SEED) \
 		--out_dir assets/stable_diffusion/smoke_tiny_last_layer
 
@@ -105,6 +118,7 @@ sd-last-ddim:
 		--n_samples $(N_SAMPLES) \
 		--height $(HEIGHT) \
 		--width $(WIDTH) \
+		--plot_max_samples $(PLOT_MAX_SAMPLES) \
 		--seed $(SEED) \
 		--out_dir assets/stable_diffusion/last_layer_ddim
 
@@ -126,6 +140,7 @@ sd-last-ddpm:
 		--n_samples $(N_SAMPLES) \
 		--height $(HEIGHT) \
 		--width $(WIDTH) \
+		--plot_max_samples $(PLOT_MAX_SAMPLES) \
 		--seed $(SEED) \
 		--out_dir assets/stable_diffusion/last_layer_ddpm
 
@@ -150,6 +165,7 @@ sd-subnet-smoke:
 		--subnet_mc_samples 1 \
 		--height $(HEIGHT) \
 		--width $(WIDTH) \
+		--plot_max_samples $(PLOT_MAX_SAMPLES) \
 		--seed $(SEED) \
 		--out_dir assets/stable_diffusion/subnet_smoke_ddim
 
@@ -174,6 +190,7 @@ sd-subnet-ddim:
 		--subnet_mc_samples $(SUBNET_MC_SAMPLES) \
 		--height $(HEIGHT) \
 		--width $(WIDTH) \
+		--plot_max_samples $(PLOT_MAX_SAMPLES) \
 		--seed $(SEED) \
 		--out_dir assets/stable_diffusion/subnet_ddim
 
@@ -198,6 +215,7 @@ sd-subnet-ddpm:
 		--subnet_mc_samples $(SUBNET_MC_SAMPLES) \
 		--height $(HEIGHT) \
 		--width $(WIDTH) \
+		--plot_max_samples $(PLOT_MAX_SAMPLES) \
 		--seed $(SEED) \
 		--out_dir assets/stable_diffusion/subnet_ddpm
 
@@ -205,6 +223,61 @@ sd-eval-ddim:
 	uv run python $(EVAL_SCRIPT) \
 		--results $(EVAL_NPZS) \
 		--out_dir "$(EVAL_OUT_DIR)" \
+		--clip_model "$(EVAL_CLIP_MODEL)" \
+		--device $(DEVICE) \
+		--torch_dtype $(TORCH_DTYPE) \
+		--batch_size $(EVAL_BATCH_SIZE) \
+		--filter_fracs "$(EVAL_FILTER_FRACS)"
+
+sdxl-last-ddim:
+	uv run python $(SD_SCRIPT) \
+		--pipeline sdxl \
+		--model_id "$(SDXL_MODEL_ID)" \
+		--prompt "$(PROMPT)" \
+		--device $(DEVICE) \
+		--torch_dtype $(TORCH_DTYPE) \
+		--scheduler ddim \
+		--laplace_mode last_layer \
+		--attention_aggregation none \
+		--steps $(STEPS_DDIM) \
+		--guidance_scale $(GUIDANCE_SCALE) \
+		--n_z0 $(N_Z0) \
+		--n_lap_pairs $(N_LAP_PAIRS) \
+		--n_samples $(N_SAMPLES) \
+		--height $(SDXL_HEIGHT) \
+		--width $(SDXL_WIDTH) \
+		--plot_max_samples $(PLOT_MAX_SAMPLES) \
+		--seed $(SEED) \
+		--out_dir assets/stable_diffusion/sdxl_last_layer_ddim
+
+sdxl-subnet-ddim:
+	uv run python $(SD_SCRIPT) \
+		--pipeline sdxl \
+		--model_id "$(SDXL_MODEL_ID)" \
+		--prompt "$(PROMPT)" \
+		--device $(DEVICE) \
+		--torch_dtype $(TORCH_DTYPE) \
+		--scheduler ddim \
+		--laplace_mode subnet \
+		--attention_aggregation none \
+		--steps $(STEPS_DDIM) \
+		--guidance_scale $(GUIDANCE_SCALE) \
+		--n_z0 $(N_Z0) \
+		--n_lap_pairs $(N_LAP_PAIRS) \
+		--n_samples $(N_SAMPLES) \
+		--subnet_n_params $(SUBNET_N_PARAMS) \
+		--subnet_max_tensors $(SUBNET_MAX_TENSORS) \
+		--subnet_mc_samples $(SUBNET_MC_SAMPLES) \
+		--height $(SDXL_HEIGHT) \
+		--width $(SDXL_WIDTH) \
+		--plot_max_samples $(PLOT_MAX_SAMPLES) \
+		--seed $(SEED) \
+		--out_dir assets/stable_diffusion/sdxl_subnet_ddim
+
+sdxl-eval-ddim:
+	uv run python $(EVAL_SCRIPT) \
+		--results $(SDXL_EVAL_NPZS) \
+		--out_dir "$(SDXL_EVAL_OUT_DIR)" \
 		--clip_model "$(EVAL_CLIP_MODEL)" \
 		--device $(DEVICE) \
 		--torch_dtype $(TORCH_DTYPE) \
