@@ -617,7 +617,7 @@ def decode_latent(vae, z, device):
     z = z / vae.config.scaling_factor
     img = vae.decode(z.to(device)).sample
     img = (img / 2 + 0.5).clamp(0, 1)
-    return img.detach().cpu().permute(0, 2, 3, 1).numpy()[0]
+    return img.detach().float().cpu().permute(0, 2, 3, 1).numpy()[0]
 
 
 def plot_results(images, var_maps, prompt, out_dir):
@@ -629,11 +629,14 @@ def plot_results(images, var_maps, prompt, out_dir):
     fig.suptitle(f'Laplace-FLARE UQ — "{prompt}"', fontsize=13, y=0.98)
 
     for i in range(n):
-        axes[0, i].imshow(images[i])
+        image = np.asarray(images[i], dtype=np.float32)
+        var_map = np.asarray(var_maps[i], dtype=np.float32)
+
+        axes[0, i].imshow(image)
         axes[0, i].set_title(f"Sample {i+1}")
         axes[0, i].axis("off")
 
-        var_gray = var_maps[i].mean(axis=0)
+        var_gray = var_map.mean(axis=0).astype(np.float32)
         im = axes[1, i].imshow(var_gray, cmap="hot", interpolation="bilinear")
         axes[1, i].set_title(f"γ² FLARE (latent)")
         axes[1, i].axis("off")
@@ -645,11 +648,11 @@ def plot_results(images, var_maps, prompt, out_dir):
                 size=images[i].shape[:2], mode="bilinear", align_corners=False,
             ).squeeze()
         )
-        std_norm = std_up / (std_up.max() + 1e-10)
-        overlay = images[i].copy()
+        std_norm = (std_up / (std_up.max() + 1e-10)).astype(np.float32)
+        overlay = image.copy()
         red = np.zeros_like(overlay)
         red[:, :, 0] = std_norm
-        overlay = np.clip(0.6 * overlay + 0.4 * red, 0, 1)
+        overlay = np.clip(0.6 * overlay + 0.4 * red, 0, 1).astype(np.float32)
         axes[2, i].imshow(overlay)
         axes[2, i].set_title("Image + uncertainty overlay")
         axes[2, i].axis("off")
