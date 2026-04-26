@@ -1,4 +1,4 @@
-.PHONY: help all all-daam sd-sync sd-smoke sd-last-ddim sd-last-ddpm sd-subnet-smoke sd-subnet-ddim sd-subnet-ddpm sd-eval-ddim sd-benchmark-ddim sdxl-last-ddim sdxl-subnet-ddim sdxl-eval-ddim sdxl-benchmark-ddim sd-daam-ddim sd-daam-subnet-ddim sd-daam-bayesdiff-ddim sd-daam-bayesdiff-ddpm sd-daam-bayesdiff-subnet-ddim sd-daam-bayesdiff-subnet-ddpm sd-daam-show sd-show
+.PHONY: help all all-daam sd-sync sd-smoke sd-last-ddim sd-last-ddpm sd-subnet-smoke sd-subnet-ddim sd-subnet-ddpm sd-eval-ddim sd-tifa-eval sd-benchmark-ddim sdxl-last-ddim sdxl-subnet-ddim sdxl-eval-ddim sdxl-benchmark-ddim sd-daam-ddim sd-daam-subnet-ddim sd-daam-bayesdiff-ddim sd-daam-bayesdiff-ddpm sd-daam-bayesdiff-subnet-ddim sd-daam-bayesdiff-subnet-ddpm sd-daam-show sd-show
 
 MODEL_ID ?= CompVis/stable-diffusion-v1-4
 SDXL_MODEL_ID ?= stabilityai/stable-diffusion-xl-base-1.0
@@ -42,11 +42,19 @@ SDXL_EVAL_OUT_DIR ?= assets/stable_diffusion/eval_sdxl_ddim
 EVAL_CLIP_MODEL ?= openai/clip-vit-base-patch32
 EVAL_BATCH_SIZE ?= 16
 EVAL_FILTER_FRACS ?= 0.1,0.2,0.3
+TIFA_EVAL_RESULTS ?= $(EVAL_NPZS)
+TIFA_OUT_DIR ?= assets/stable_diffusion/tifa_eval
+TIFA_QUESTION_CACHE ?= $(TIFA_OUT_DIR)/tifa_questions.json
+TIFA_OPENAI_MODEL ?= gpt-4.1
+TIFA_MAX_SAMPLES ?= 0
+TIFA_MAX_QUESTIONS ?= 0
+TIFA_REQUIRE_CACHED ?=
 
 SD_SCRIPT := experiments/stable_diffusion/run_sd_laplace.py
 DAAM_SCRIPT := experiments/stable_diffusion/run_daam_attention.py
 DAAM_BAYESDIFF_SCRIPT := experiments/stable_diffusion/run_daam_bayesdiff_pipeline.py
 EVAL_SCRIPT := experiments/stable_diffusion/evaluate_sd_uq.py
+TIFA_EVAL_SCRIPT := experiments/stable_diffusion/evaluate_tifa_uq.py
 
 help:
 	@echo "Stable Diffusion UQ targets:"
@@ -60,6 +68,7 @@ help:
 	@echo "  make sd-subnet-ddim   SD v1.4 random subnet FLARE + DDIM"
 	@echo "  make sd-subnet-ddpm   SD v1.4 random subnet FLARE + DDPM"
 	@echo "  make sd-eval-ddim     evaluate last_layer_ddim and subnet_ddim with CLIPScore"
+	@echo "  make sd-tifa-eval     evaluate UQ rankings with local TIFA-like VQA scoring"
 	@echo "  make sd-benchmark-ddim  run last/subnet DDIM, then evaluate"
 	@echo "  make sdxl-last-ddim   SDXL base conv_out LLLA + DDIM"
 	@echo "  make sdxl-subnet-ddim SDXL base random subnet FLARE + DDIM"
@@ -93,7 +102,7 @@ sd-benchmark-ddim: sd-last-ddim sd-subnet-ddim sd-eval-ddim
 sdxl-benchmark-ddim: sdxl-last-ddim sdxl-subnet-ddim sdxl-eval-ddim
 
 sd-sync:
-	uv sync --extra stable-diffusion --extra dev
+	uv sync --extra stable-diffusion --extra tifa --extra dev
 
 sd-smoke:
 	uv run python $(SD_SCRIPT) \
@@ -243,6 +252,18 @@ sd-eval-ddim:
 		--torch_dtype $(TORCH_DTYPE) \
 		--batch_size $(EVAL_BATCH_SIZE) \
 		--filter_fracs "$(EVAL_FILTER_FRACS)"
+
+sd-tifa-eval:
+	uv run --extra stable-diffusion --extra tifa python $(TIFA_EVAL_SCRIPT) \
+		--results $(TIFA_EVAL_RESULTS) \
+		--out_dir "$(TIFA_OUT_DIR)" \
+		--question_cache "$(TIFA_QUESTION_CACHE)" \
+		--openai_model "$(TIFA_OPENAI_MODEL)" \
+		--device $(DEVICE) \
+		--max_samples $(TIFA_MAX_SAMPLES) \
+		--max_questions $(TIFA_MAX_QUESTIONS) \
+		--filter_fracs "$(EVAL_FILTER_FRACS)" \
+		$(TIFA_REQUIRE_CACHED)
 
 sdxl-last-ddim:
 	uv run python $(SD_SCRIPT) \
