@@ -27,7 +27,14 @@ from evaluate_sd_uq import (
     uncertainty_metrics,
     write_csv,
 )
-from uqdiff.tifa_like.question_gen import DEFAULT_OPENAI_MODEL, DEFAULT_PROMPT_PATH, generate_questions
+from uqdiff.tifa_like.heuristic_question_gen import generate_heuristic_questions
+from uqdiff.tifa_like.question_gen import (
+    DEFAULT_OPENAI_MODEL,
+    DEFAULT_PROMPT_PATH,
+    DEFAULT_TOGETHER_MODEL,
+    generate_questions,
+    generate_questions_together,
+)
 from uqdiff.tifa_like.schemas import TifaQuestion
 from uqdiff.tifa_like.scorer import score_image
 from uqdiff.tifa_like.vqa import DEFAULT_SBERT_CHECKPOINT, DEFAULT_VQA_CHECKPOINT, TifaLikeVQAModel
@@ -73,10 +80,22 @@ def get_args():
         help="Regenerate questions even when cached questions exist.",
     )
     p.add_argument(
+        "--question_source",
+        choices=["openai", "together", "heuristic"],
+        default="openai",
+        help="Use OpenAI, Together AI, or an offline heuristic question generator.",
+    )
+    p.add_argument(
         "--openai_model",
         type=str,
         default=DEFAULT_OPENAI_MODEL,
         help="OpenAI model for question generation.",
+    )
+    p.add_argument(
+        "--together_model",
+        type=str,
+        default=DEFAULT_TOGETHER_MODEL,
+        help="Together AI model for question generation.",
     )
     p.add_argument(
         "--prompt_path",
@@ -181,8 +200,21 @@ def resolve_questions(
             f"No cached TIFA questions for prompt {prompt!r} in {cache_path}"
         )
 
-    prompt_path = Path(args.prompt_path) if args.prompt_path else None
-    questions = generate_questions(prompt, model=args.openai_model, prompt_path=prompt_path)
+    if args.question_source == "heuristic":
+        questions = generate_heuristic_questions(
+            prompt,
+            max_questions=args.max_questions or 12,
+        )
+    elif args.question_source == "together":
+        prompt_path = Path(args.prompt_path) if args.prompt_path else None
+        questions = generate_questions_together(
+            prompt,
+            model=args.together_model,
+            prompt_path=prompt_path,
+        )
+    else:
+        prompt_path = Path(args.prompt_path) if args.prompt_path else None
+        questions = generate_questions(prompt, model=args.openai_model, prompt_path=prompt_path)
     normalized = [normalize_question_dict(q) for q in questions]
     if args.max_questions:
         normalized = normalized[: args.max_questions]

@@ -122,6 +122,19 @@ questions without calling OpenAI:
 make sd-tifa-eval TIFA_REQUIRE_CACHED=--require_cached_questions
 ```
 
+For quota-free smoke tests, use the offline heuristic question generator:
+
+```bash
+make sd-tifa-eval TIFA_QUESTION_SOURCE=heuristic
+```
+
+Together AI can be used instead of OpenAI for question generation:
+
+```bash
+export TOGETHER_API_KEY=...
+make sd-tifa-eval TIFA_QUESTION_SOURCE=together
+```
+
 Outputs are written to `summary.csv`, `per_sample.csv`, `per_question.csv`, and
 `summary.md` in `TIFA_OUT_DIR`.
 

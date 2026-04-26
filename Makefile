@@ -46,6 +46,8 @@ TIFA_EVAL_RESULTS ?= $(EVAL_NPZS)
 TIFA_OUT_DIR ?= assets/stable_diffusion/tifa_eval
 TIFA_QUESTION_CACHE ?= $(TIFA_OUT_DIR)/tifa_questions.json
 TIFA_OPENAI_MODEL ?= gpt-4.1
+TIFA_TOGETHER_MODEL ?= meta-llama/Llama-3.3-70B-Instruct-Turbo
+TIFA_QUESTION_SOURCE ?= openai
 TIFA_MAX_SAMPLES ?= 0
 TIFA_MAX_QUESTIONS ?= 0
 TIFA_REQUIRE_CACHED ?=
@@ -254,11 +256,13 @@ sd-eval-ddim:
 		--filter_fracs "$(EVAL_FILTER_FRACS)"
 
 sd-tifa-eval:
-	uv run --extra stable-diffusion --extra tifa python $(TIFA_EVAL_SCRIPT) \
+	uv run --extra tifa python $(TIFA_EVAL_SCRIPT) \
 		--results $(TIFA_EVAL_RESULTS) \
 		--out_dir "$(TIFA_OUT_DIR)" \
 		--question_cache "$(TIFA_QUESTION_CACHE)" \
+		--question_source "$(TIFA_QUESTION_SOURCE)" \
 		--openai_model "$(TIFA_OPENAI_MODEL)" \
+		--together_model "$(TIFA_TOGETHER_MODEL)" \
 		--device $(DEVICE) \
 		--max_samples $(TIFA_MAX_SAMPLES) \
 		--max_questions $(TIFA_MAX_QUESTIONS) \
