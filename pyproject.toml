@@ -33,6 +33,21 @@ experiments = [
     "scikit-learn",
     "cmcrameri",
 ]
+stable-diffusion = [
+    "diffusers>=0.30",
+    "transformers>=4.40",
+    "accelerate>=0.30",
+    "safetensors>=0.4",
+    "pillow>=10",
+    "matplotlib",
+]
+tifa = [
+    "openai>=2.30",
+    "pillow>=10",
+    "pydantic>=2.12",
+    "pyyaml>=6.0",
+    "transformers>=4.40",
+]
 dev = [
     "pytest",
     "pytest-cov",
@@ -43,3 +58,6 @@ where = ["src"]
 
 [tool.setuptools.package-dir]
 "" = "src"
+
+[tool.setuptools.package-data]
+"uqdiff.tifa_like" = ["prompt.yaml"]
