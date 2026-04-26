@@ -101,6 +101,30 @@ python experiments/sines/plot_uncertainty.py --results assets/sines/results.pkl
 python experiments/chirp/plot_uncertainty.py --results assets/chirp/results.pkl
 ```
 
+## TIFA-like semantic evaluation
+
+This repo includes a local TIFA-like evaluator under `src/uqdiff/tifa_like`, so
+it does not require the sibling `clarify-diffusion` project at runtime.
+
+```bash
+make sd-sync
+export OPENAI_API_KEY=...
+make sd-tifa-eval \
+    TIFA_EVAL_RESULTS="assets/stable_diffusion/last_layer_ddim/laplace_results.npz assets/stable_diffusion/subnet_ddim/laplace_results.npz" \
+    DEVICE=cuda
+```
+
+The first run generates and caches VQA questions in
+`assets/stable_diffusion/tifa_eval/tifa_questions.json`. To reuse cached
+questions without calling OpenAI:
+
+```bash
+make sd-tifa-eval TIFA_REQUIRE_CACHED=--require_cached_questions
+```
+
+Outputs are written to `summary.csv`, `per_sample.csv`, `per_question.csv`, and
+`summary.md` in `TIFA_OUT_DIR`.
+
 ---
 
 ## Using the package with your own model
