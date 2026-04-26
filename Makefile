@@ -1,4 +1,4 @@
-.PHONY: help all all-daam sd-sync sd-smoke sd-last-ddim sd-last-ddpm sd-subnet-smoke sd-subnet-ddim sd-subnet-ddpm sd-eval-ddim sd-tifa-eval sd-benchmark-ddim sdxl-last-ddim sdxl-subnet-ddim sdxl-eval-ddim sdxl-benchmark-ddim sd-daam-ddim sd-daam-subnet-ddim sd-daam-bayesdiff-ddim sd-daam-bayesdiff-ddpm sd-daam-bayesdiff-subnet-ddim sd-daam-bayesdiff-subnet-ddpm sd-daam-show sd-show
+.PHONY: help all all-daam sd-sync sd-smoke sd-last-ddim sd-last-ddpm sd-subnet-smoke sd-subnet-ddim sd-subnet-ddpm sd-eval-ddim sd-tifa-eval sd-recap-prompts sd-recap-run sd-recap-tifa sd-benchmark-ddim sdxl-last-ddim sdxl-subnet-ddim sdxl-eval-ddim sdxl-benchmark-ddim sd-daam-ddim sd-daam-subnet-ddim sd-daam-bayesdiff-ddim sd-daam-bayesdiff-ddpm sd-daam-bayesdiff-subnet-ddim sd-daam-bayesdiff-subnet-ddpm sd-daam-show sd-show
 
 MODEL_ID ?= CompVis/stable-diffusion-v1-4
 SDXL_MODEL_ID ?= stabilityai/stable-diffusion-xl-base-1.0
@@ -51,12 +51,19 @@ TIFA_QUESTION_SOURCE ?= openai
 TIFA_MAX_SAMPLES ?= 0
 TIFA_MAX_QUESTIONS ?= 0
 TIFA_REQUIRE_CACHED ?=
+RECAP_PROMPTS ?= assets/stable_diffusion/recap_coco_prompts.jsonl
+RECAP_OUT_ROOT ?= assets/stable_diffusion/recap_probe
+RECAP_N_PROMPTS ?= 30
+RECAP_METHODS ?= last_layer,subnet
+RECAP_N_SAMPLES ?= 8
 
 SD_SCRIPT := experiments/stable_diffusion/run_sd_laplace.py
 DAAM_SCRIPT := experiments/stable_diffusion/run_daam_attention.py
 DAAM_BAYESDIFF_SCRIPT := experiments/stable_diffusion/run_daam_bayesdiff_pipeline.py
 EVAL_SCRIPT := experiments/stable_diffusion/evaluate_sd_uq.py
 TIFA_EVAL_SCRIPT := experiments/stable_diffusion/evaluate_tifa_uq.py
+RECAP_PROMPT_SCRIPT := experiments/stable_diffusion/sample_recap_coco_prompts.py
+PROMPT_BATCH_SCRIPT := experiments/stable_diffusion/run_prompt_batch.py
 
 help:
 	@echo "Stable Diffusion UQ targets:"
@@ -71,6 +78,9 @@ help:
 	@echo "  make sd-subnet-ddpm   SD v1.4 random subnet FLARE + DDPM"
 	@echo "  make sd-eval-ddim     evaluate last_layer_ddim and subnet_ddim with CLIPScore"
 	@echo "  make sd-tifa-eval     evaluate UQ rankings with local TIFA-like VQA scoring"
+	@echo "  make sd-recap-prompts sample Recap-COCO prompts for a prompt batch"
+	@echo "  make sd-recap-run     run last_layer/subnet UQ for sampled Recap-COCO prompts"
+	@echo "  make sd-recap-tifa    run TIFA-like eval over the Recap-COCO batch"
 	@echo "  make sd-benchmark-ddim  run last/subnet DDIM, then evaluate"
 	@echo "  make sdxl-last-ddim   SDXL base conv_out LLLA + DDIM"
 	@echo "  make sdxl-subnet-ddim SDXL base random subnet FLARE + DDIM"
@@ -260,6 +270,44 @@ sd-tifa-eval:
 		--results $(TIFA_EVAL_RESULTS) \
 		--out_dir "$(TIFA_OUT_DIR)" \
 		--question_cache "$(TIFA_QUESTION_CACHE)" \
+		--question_source "$(TIFA_QUESTION_SOURCE)" \
+		--openai_model "$(TIFA_OPENAI_MODEL)" \
+		--together_model "$(TIFA_TOGETHER_MODEL)" \
+		--device $(DEVICE) \
+		--max_samples $(TIFA_MAX_SAMPLES) \
+		--max_questions $(TIFA_MAX_QUESTIONS) \
+		--filter_fracs "$(EVAL_FILTER_FRACS)" \
+		$(TIFA_REQUIRE_CACHED)
+
+sd-recap-prompts:
+	uv run --extra recap python $(RECAP_PROMPT_SCRIPT) \
+		--n $(RECAP_N_PROMPTS) \
+		--out "$(RECAP_PROMPTS)"
+
+sd-recap-run:
+	uv run --extra stable-diffusion python $(PROMPT_BATCH_SCRIPT) \
+		--prompts "$(RECAP_PROMPTS)" \
+		--out_root "$(RECAP_OUT_ROOT)" \
+		--methods "$(RECAP_METHODS)" \
+		--device $(DEVICE) \
+		--torch_dtype $(TORCH_DTYPE) \
+		--steps $(STEPS_DDIM) \
+		--guidance_scale $(GUIDANCE_SCALE) \
+		--n_samples $(RECAP_N_SAMPLES) \
+		--n_z0 $(N_Z0) \
+		--n_lap_pairs $(N_LAP_PAIRS) \
+		--height $(HEIGHT) \
+		--width $(WIDTH) \
+		--subnet_n_params $(SUBNET_N_PARAMS) \
+		--subnet_max_tensors $(SUBNET_MAX_TENSORS) \
+		--subnet_mc_samples $(SUBNET_MC_SAMPLES) \
+		--skip_existing
+
+sd-recap-tifa:
+	uv run --extra tifa python $(TIFA_EVAL_SCRIPT) \
+		--results_file "$(RECAP_OUT_ROOT)/results.txt" \
+		--out_dir "$(RECAP_OUT_ROOT)/tifa_eval" \
+		--question_cache "$(RECAP_OUT_ROOT)/tifa_eval/tifa_questions.json" \
 		--question_source "$(TIFA_QUESTION_SOURCE)" \
 		--openai_model "$(TIFA_OPENAI_MODEL)" \
 		--together_model "$(TIFA_TOGETHER_MODEL)" \

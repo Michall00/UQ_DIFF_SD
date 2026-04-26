@@ -44,9 +44,15 @@ def get_args():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--results",
-        nargs="+",
-        required=True,
+        nargs="*",
+        default=[],
         help="One or more laplace_results.npz files produced by run_sd_laplace.py.",
+    )
+    p.add_argument(
+        "--results_file",
+        type=str,
+        default="",
+        help="Text file with one laplace_results.npz path per line.",
     )
     p.add_argument(
         "--out_dir",
@@ -316,6 +322,21 @@ def truncate_metrics(metrics: dict[str, np.ndarray], n: int) -> dict[str, np.nda
     return {name: np.asarray(values[:n]) for name, values in metrics.items()}
 
 
+def resolve_result_paths(args) -> list[str]:
+    paths = list(args.results)
+    if args.results_file:
+        results_file = Path(args.results_file)
+        file_paths = [
+            line.strip()
+            for line in results_file.read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        paths.extend(file_paths)
+    if not paths:
+        raise SystemExit("Pass --results and/or --results_file.")
+    return paths
+
+
 def main():
     args = get_args()
     out_dir = Path(args.out_dir)
@@ -334,7 +355,7 @@ def main():
     all_sample_rows = []
     all_question_rows = []
 
-    for result_path in args.results:
+    for result_path in resolve_result_paths(args):
         data = np.load(result_path, allow_pickle=True)
         method = method_name(result_path)
         prompt = npz_prompt(data, args.prompt)

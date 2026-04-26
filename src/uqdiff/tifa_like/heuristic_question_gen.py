@@ -213,8 +213,8 @@ def generate_heuristic_questions(caption: str, max_questions: int = 12) -> list[
     ]
     for pattern, element_type, template in relation_patterns:
         for match in re.finditer(pattern, caption.lower()):
-            left = _clean_phrase(match.group(1).split()[-3:])
-            right = _clean_phrase(match.group(2).split()[:3])
+            left = _clean_phrase(" ".join(match.group(1).split()[-3:]))
+            right = _clean_phrase(" ".join(match.group(2).split()[:3]))
             if left and right:
                 _add_unique(
                     questions,
