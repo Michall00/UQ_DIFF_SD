@@ -48,6 +48,9 @@ tifa = [
     "pyyaml>=6.0",
     "transformers>=4.40",
 ]
+recap = [
+    "datasets>=3.0",
+]
 dev = [
     "pytest",
     "pytest-cov",
