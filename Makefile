@@ -1,4 +1,4 @@
-.PHONY: help all all-daam sd-sync sd-smoke sd-last-ddim sd-last-ddpm sd-subnet-smoke sd-subnet-ddim sd-subnet-ddpm sd-eval-ddim sd-tifa-eval sd-punc-eval sd-recap-prompts sd-recap-run sd-recap-tifa sd-recap-punc sd-benchmark-ddim sdxl-last-ddim sdxl-subnet-ddim sdxl-eval-ddim sdxl-benchmark-ddim sd-daam-ddim sd-daam-subnet-ddim sd-daam-bayesdiff-ddim sd-daam-bayesdiff-ddpm sd-daam-bayesdiff-subnet-ddim sd-daam-bayesdiff-subnet-ddpm sd-daam-show sd-show
+.PHONY: help all all-daam sd-sync sd-smoke sd-last-ddim sd-last-ddpm sd-subnet-smoke sd-subnet-ddim sd-subnet-ddpm sd-eval-ddim sd-tifa-eval sd-punc-eval sd-filtering-run sd-filtering-clip sd-filtering-ranking sd-filtering-tifa sd-filtering-punc sd-recap-prompts sd-recap-run sd-recap-tifa sd-recap-punc sd-benchmark-ddim sdxl-last-ddim sdxl-subnet-ddim sdxl-eval-ddim sdxl-benchmark-ddim sd-daam-ddim sd-daam-subnet-ddim sd-daam-bayesdiff-ddim sd-daam-bayesdiff-ddpm sd-daam-bayesdiff-subnet-ddim sd-daam-bayesdiff-subnet-ddpm sd-daam-show sd-show
 
 MODEL_ID ?= CompVis/stable-diffusion-v1-4
 SDXL_MODEL_ID ?= stabilityai/stable-diffusion-xl-base-1.0
@@ -64,6 +64,12 @@ RECAP_OUT_ROOT ?= assets/stable_diffusion/recap_probe
 RECAP_N_PROMPTS ?= 30
 RECAP_METHODS ?= last_layer,subnet
 RECAP_N_SAMPLES ?= 8
+FILTER_PROMPTS ?= experiments/stable_diffusion/filtering_prompts.txt
+FILTER_OUT_ROOT ?= assets/stable_diffusion/filtering_ranking
+FILTER_METHODS ?= last_layer,subnet
+FILTER_N_SAMPLES ?= 100
+FILTER_LIMIT ?= 0
+FILTER_SKIP_EXISTING ?= --skip_existing
 
 SD_SCRIPT := experiments/stable_diffusion/run_sd_laplace.py
 DAAM_SCRIPT := experiments/stable_diffusion/run_daam_attention.py
@@ -92,6 +98,9 @@ help:
 	@echo "  make sd-recap-run     run last_layer/subnet UQ for sampled Recap-COCO prompts"
 	@echo "  make sd-recap-tifa    run TIFA-like eval over the Recap-COCO batch"
 	@echo "  make sd-recap-punc    run PUNC-like eval over the Recap-COCO batch"
+	@echo "  make sd-filtering-ranking  run per-prompt filtering/ranking with CLIPScore"
+	@echo "  make sd-filtering-tifa     run TIFA-like eval for filtering/ranking outputs"
+	@echo "  make sd-filtering-punc     run PUNC-like eval for filtering/ranking outputs"
 	@echo "  make sd-benchmark-ddim  run last/subnet DDIM, then evaluate"
 	@echo "  make sdxl-last-ddim   SDXL base conv_out LLLA + DDIM"
 	@echo "  make sdxl-subnet-ddim SDXL base random subnet FLARE + DDIM"
@@ -111,6 +120,7 @@ help:
 	@echo "  make sd-subnet-ddpm STEPS_DDPM=1000"
 	@echo "  make sd-subnet-ddim ATTENTION_AGGREGATION=cross SAVE_ATTENTION_MAPS=--save_attention_maps"
 	@echo "  make sd-benchmark-ddim N_SAMPLES=100"
+	@echo "  make sd-filtering-ranking FILTER_N_SAMPLES=100 FILTER_LIMIT=10"
 	@echo "  make sdxl-benchmark-ddim PROMPT=\"a soccer match in a packed stadium\" N_SAMPLES=50"
 	@echo "  make sd-daam-subnet-ddim DAAM_WORDS=hand,fingers  # empty DAAM_WORDS auto-infers prompt words"
 	@echo "  make sd-daam-bayesdiff-ddim DAAM_WORDS=player,ball N_SAMPLES=16"
@@ -295,6 +305,68 @@ sd-punc-eval:
 		--results $(PUNC_EVAL_RESULTS) \
 		--out_dir "$(PUNC_OUT_DIR)" \
 		--caption_cache "$(PUNC_CAPTION_CACHE)" \
+		--openai_model "$(PUNC_OPENAI_MODEL)" \
+		--image_detail "$(PUNC_IMAGE_DETAIL)" \
+		--max_samples $(PUNC_MAX_SAMPLES) \
+		--similarity "$(PUNC_SIMILARITY)" \
+		--device $(DEVICE) \
+		--filter_fracs "$(EVAL_FILTER_FRACS)" \
+		$(PUNC_REQUIRE_CACHED)
+
+sd-filtering-run:
+	uv run --extra stable-diffusion python $(PROMPT_BATCH_SCRIPT) \
+		--prompts "$(FILTER_PROMPTS)" \
+		--out_root "$(FILTER_OUT_ROOT)" \
+		--methods "$(FILTER_METHODS)" \
+		--model_id "$(MODEL_ID)" \
+		--device $(DEVICE) \
+		--torch_dtype $(TORCH_DTYPE) \
+		--scheduler ddim \
+		--steps $(STEPS_DDIM) \
+		--guidance_scale $(GUIDANCE_SCALE) \
+		--n_samples $(FILTER_N_SAMPLES) \
+		--n_z0 $(N_Z0) \
+		--n_lap_pairs $(N_LAP_PAIRS) \
+		--height $(HEIGHT) \
+		--width $(WIDTH) \
+		--subnet_n_params $(SUBNET_N_PARAMS) \
+		--subnet_max_tensors $(SUBNET_MAX_TENSORS) \
+		--subnet_mc_samples $(SUBNET_MC_SAMPLES) \
+		--limit $(FILTER_LIMIT) \
+		$(FILTER_SKIP_EXISTING)
+
+sd-filtering-clip:
+	uv run --extra stable-diffusion python $(EVAL_SCRIPT) \
+		--results_file "$(FILTER_OUT_ROOT)/results.txt" \
+		--out_dir "$(FILTER_OUT_ROOT)/clip_eval" \
+		--clip_model "$(EVAL_CLIP_MODEL)" \
+		--device $(DEVICE) \
+		--torch_dtype $(TORCH_DTYPE) \
+		--batch_size $(EVAL_BATCH_SIZE) \
+		--filter_fracs "$(EVAL_FILTER_FRACS)" \
+		--include_random_baseline
+
+sd-filtering-ranking: sd-filtering-run sd-filtering-clip
+
+sd-filtering-tifa:
+	uv run --extra tifa python $(TIFA_EVAL_SCRIPT) \
+		--results_file "$(FILTER_OUT_ROOT)/results.txt" \
+		--out_dir "$(FILTER_OUT_ROOT)/tifa_eval" \
+		--question_cache "$(FILTER_OUT_ROOT)/tifa_eval/tifa_questions.json" \
+		--question_source "$(TIFA_QUESTION_SOURCE)" \
+		--openai_model "$(TIFA_OPENAI_MODEL)" \
+		--together_model "$(TIFA_TOGETHER_MODEL)" \
+		--device $(DEVICE) \
+		--max_samples $(TIFA_MAX_SAMPLES) \
+		--max_questions $(TIFA_MAX_QUESTIONS) \
+		--filter_fracs "$(EVAL_FILTER_FRACS)" \
+		$(TIFA_REQUIRE_CACHED)
+
+sd-filtering-punc:
+	uv run --extra tifa python $(PUNC_EVAL_SCRIPT) \
+		--results_file "$(FILTER_OUT_ROOT)/results.txt" \
+		--out_dir "$(FILTER_OUT_ROOT)/punc_eval" \
+		--caption_cache "$(FILTER_OUT_ROOT)/punc_eval/punc_captions.json" \
 		--openai_model "$(PUNC_OPENAI_MODEL)" \
 		--image_detail "$(PUNC_IMAGE_DETAIL)" \
 		--max_samples $(PUNC_MAX_SAMPLES) \
