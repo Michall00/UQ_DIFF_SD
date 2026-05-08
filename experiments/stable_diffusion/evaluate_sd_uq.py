@@ -24,9 +24,15 @@ def get_args():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--results",
-        nargs="+",
-        required=True,
+        nargs="*",
+        default=[],
         help="One or more laplace_results.npz files.",
+    )
+    p.add_argument(
+        "--results_file",
+        type=str,
+        default="",
+        help="Text file with one laplace_results.npz path per line.",
     )
     p.add_argument(
         "--out_dir",
@@ -60,6 +66,12 @@ def get_args():
         action="store_true",
         help="Only compute uncertainty summaries, no CLIPScore.",
     )
+    p.add_argument(
+        "--include_random_baseline",
+        action="store_true",
+        help="Add a deterministic random uncertainty score as a rejection baseline.",
+    )
+    p.add_argument("--random_seed", type=int, default=0)
     return p.parse_args()
 
 
@@ -251,6 +263,20 @@ def method_name(path: str) -> str:
     return parent or Path(path).stem
 
 
+def resolve_result_paths(args) -> list[str]:
+    paths = list(args.results)
+    if args.results_file:
+        results_file = Path(args.results_file)
+        paths.extend(
+            line.strip()
+            for line in results_file.read_text().splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        )
+    if not paths:
+        raise ValueError("Pass --results or --results_file.")
+    return paths
+
+
 def summarize_method(
     method: str,
     result_path: str,
@@ -339,6 +365,83 @@ def write_markdown(path: Path, rows: list[dict[str, object]]):
     path.write_text("\n".join(lines) + "\n")
 
 
+def aggregate_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    groups: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for row in rows:
+        key = (str(row["method"]), str(row["uncertainty_metric"]))
+        groups.setdefault(key, []).append(row)
+
+    preferred = [
+        "clip_mean_all",
+        "pearson_uq_clip",
+        "spearman_uq_clip",
+        "reject_top_10pct_clip_delta",
+        "reject_top_20pct_clip_delta",
+        "reject_top_30pct_clip_delta",
+        "reject_top_10pct_clip_mean_kept",
+        "reject_top_20pct_clip_mean_kept",
+        "reject_top_30pct_clip_mean_kept",
+    ]
+    out = []
+    for (method, metric), group in sorted(groups.items()):
+        row = {
+            "method": method,
+            "uncertainty_metric": metric,
+            "n_groups": len(group),
+            "n_total": int(sum(int(r.get("n", 0)) for r in group)),
+        }
+        for column in preferred:
+            values = [
+                float(r[column])
+                for r in group
+                if column in r and isinstance(r[column], (int, float)) and math.isfinite(float(r[column]))
+            ]
+            if values:
+                arr = np.asarray(values, dtype=np.float64)
+                row[f"{column}_mean"] = float(arr.mean())
+                row[f"{column}_std"] = float(arr.std(ddof=0))
+        out.append(row)
+    return out
+
+
+def write_aggregate_markdown(path: Path, rows: list[dict[str, object]]):
+    primary_names = {
+        "var_mean",
+        "var_p95",
+        "var_attn_mean",
+        "bayesdiff_var_mean",
+        "bayesdiff_var_p95",
+        "random",
+    }
+    primary = [r for r in rows if r["uncertainty_metric"] in primary_names] or rows
+    columns = [
+        "method",
+        "uncertainty_metric",
+        "n_groups",
+        "n_total",
+        "clip_mean_all_mean",
+        "pearson_uq_clip_mean",
+        "spearman_uq_clip_mean",
+        "reject_top_20pct_clip_delta_mean",
+        "reject_top_20pct_clip_delta_std",
+    ]
+    available = [c for c in columns if any(c in r for r in primary)]
+    lines = ["# Stable Diffusion UQ Evaluation - Per-Prompt Aggregate", ""]
+    lines.append("| " + " | ".join(available) + " |")
+    lines.append("| " + " | ".join(["---"] * len(available)) + " |")
+    for row in primary:
+        values = []
+        for col in available:
+            value = row.get(col, "")
+            if isinstance(value, float):
+                value = f"{value:.6g}"
+            values.append(str(value))
+        lines.append("| " + " | ".join(values) + " |")
+    lines.append("")
+    lines.append("Filtering is computed within each result file/prompt, then averaged across prompts.")
+    path.write_text("\n".join(lines) + "\n")
+
+
 def main():
     args = get_args()
     out_dir = Path(args.out_dir)
@@ -352,13 +455,17 @@ def main():
 
     all_summary_rows = []
     all_sample_rows = []
+    result_paths = resolve_result_paths(args)
 
-    for result_path in args.results:
+    for result_idx, result_path in enumerate(result_paths):
         data = np.load(result_path, allow_pickle=True)
         method = method_name(result_path)
         prompt = npz_prompt(data, args.prompt)
         images = np.asarray(data["images"], dtype=np.float32)
         metrics = uncertainty_metrics(data)
+        if args.include_random_baseline:
+            rng = np.random.default_rng(args.random_seed + result_idx)
+            metrics["random"] = rng.random(images.shape[0], dtype=np.float32)
 
         quality = None
         if clip is not None:
@@ -382,10 +489,15 @@ def main():
     write_csv(out_dir / "per_sample.csv", all_sample_rows)
     write_markdown(out_dir / "summary.md", all_summary_rows)
     (out_dir / "summary.json").write_text(json.dumps(all_summary_rows, indent=2) + "\n")
+    aggregate = aggregate_rows(all_summary_rows)
+    write_csv(out_dir / "summary_by_method.csv", aggregate)
+    write_aggregate_markdown(out_dir / "summary_by_method.md", aggregate)
 
     print(f"Saved {out_dir / 'summary.csv'}")
     print(f"Saved {out_dir / 'per_sample.csv'}")
     print(f"Saved {out_dir / 'summary.md'}")
+    print(f"Saved {out_dir / 'summary_by_method.csv'}")
+    print(f"Saved {out_dir / 'summary_by_method.md'}")
 
 
 if __name__ == "__main__":
