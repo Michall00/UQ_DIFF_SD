@@ -346,7 +346,9 @@ sd-filtering-clip:
 		--filter_fracs "$(EVAL_FILTER_FRACS)" \
 		--include_random_baseline
 
-sd-filtering-ranking: sd-filtering-run sd-filtering-clip
+sd-filtering-ranking:
+	$(MAKE) sd-filtering-run
+	$(MAKE) sd-filtering-clip
 
 sd-filtering-tifa:
 	uv run --extra tifa python $(TIFA_EVAL_SCRIPT) \
